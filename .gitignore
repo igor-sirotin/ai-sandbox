@@ -1,0 +1,8 @@
+# Per-project configs reference tokens / private identities. Keep the sample.
+/projects/*.conf
+
+# macOS
+.DS_Store
+
+# Personal working notes
+/TODO

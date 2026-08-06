@@ -1,0 +1,39 @@
+# Example project config. Normally you don't hand-write this — run:
+#     sandbox new <project>
+# which asks the questions and writes projects/<project>.conf for you.
+#
+# A project is one VM (claude-<project>) with its own GitHub identities.
+# Tokens live in the macOS Keychain (sandbox secret set <name>); this file only
+# references them by name. The FIRST identity is primary: it sets the default
+# git commit identity, the active `gh` account, and owns the VM's SSH/signing key.
+#
+# This file is SHELL CODE — the launcher `source`s it. Keep it `chmod 600` and
+# owned by you (that's what `sandbox new` does); it refuses to read a config that
+# is group/world-writable. Quote any value containing spaces.
+
+add_identity \
+  --github-username my-user \
+  --git-name        "My Name" \
+  --git-email       me@example.com \
+  --token-keychain  acme-my-user
+
+# Agent opened by a bare `sandbox <project>`. Omit for the default (claude).
+# See available agents with `sandbox agents`, or: sandbox <project> agent default <name>
+use_agent claude
+
+# Optional: a second account whose token is used only for repos under one org.
+# Routing is by longest "<host>/<org>" match; everything else uses the primary.
+# add_identity \
+#   --github-username my-bot \
+#   --token-keychain  acme-my-bot \
+#   --org-scope       github.com/some-org
+
+# Arguments:
+#   --github-username  GitHub login for this account            (required)
+#   --token-keychain   Keychain item holding this account's PAT (required)
+#   --git-name         commit author name    (primary identity only)
+#   --git-email        commit author email   (primary identity only)
+#   --org-scope        <host>/<org> to route to this token (repeatable)
+#   --github-host      GitHub host (default: github.com)
+#
+# use_agent <name>     agent for a bare `sandbox <project>` (default: claude)

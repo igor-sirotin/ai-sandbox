@@ -1,0 +1,209 @@
+# Lima template for a coding-agent sandbox VM — one instance per project,
+# managed by the `sandbox` launcher. A real, persistent, mutable Linux VM
+# (Apple Virtualization.framework): install whatever you want and it sticks.
+# No host directories are mounted, so the host stays isolated; the launcher
+# injects the project's GitHub identities/tokens and repos are cloned inside.
+#
+# This template provisions toolchains only. The agents themselves (Claude Code,
+# OpenCode, ...) are installed on first use from agents/<name>.conf.
+#
+# Scope of the isolation: this is a filesystem and process boundary, not a
+# network one. The VM has unrestricted egress — the internet, your LAN, your
+# VPN routes, and the host itself via host.lima.internal — and Lima forwards
+# ports the guest binds to the host's loopback. Treat anything the VM can reach
+# over the network as reachable by the agent.
+
+vmType: "vz"
+vmOpts:
+  vz:
+    rosetta:
+      enabled: true    # run occasional x86_64 binaries under emulation
+      binfmt: true
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+cpus: 4
+memory: "8GiB"
+disk: "60GiB"
+
+# Full isolation: nothing from the host filesystem is mounted, ever. The launcher
+# has no subcommand that adds one — move files with scp/rsync over the VM's SSH
+# host, or with git.
+mounts: []
+
+# Don't trust the host's personal SSH keys; Lima's own generated key still works.
+ssh:
+  loadDotSSHPubKeys: false
+
+# We don't need containerd/nerdctl inside these VMs.
+containerd:
+  system: false
+  user: false
+
+provision:
+  # ---- system toolchains (run as root) ----
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+
+      # ------------------------------------------------------------- pins
+      # Go, Nim and rustup-init are pinned to an exact version and checked
+      # against a hash recorded here, so a compromised mirror or a moved
+      # "latest" tag can't silently change what lands in the VM. gh and Node
+      # come from signature-verified apt repos. Two things are deliberately
+      # not hash-pinned: the Determinate Nix installer (pinned to a release
+      # tag, but piped to sh), and @anthropic-ai/claude-code, which is a
+      # bootstrap that `claude install` immediately replaces with a
+      # self-updating native build — pinning it would be defeated on first run.
+      # To bump a pin, take the new version's published checksum:
+      #   Go    https://go.dev/dl/?mode=json
+      #   Nim   https://nim-lang.org/download/nim-<ver>.tar.xz.sha256
+      #   Rust  https://static.rust-lang.org/rustup/archive/<ver>/<triple>/rustup-init.sha256
+      #   Nix   https://github.com/DeterminateSystems/nix-installer/releases
+      GO_VER="1.26.5"
+      GO_SHA256_arm64="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
+      GO_SHA256_amd64="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+      NIM_VER="2.2.10"
+      NIM_SHA256="7957b7ed004206bcf10bcc4f3b4744153878e62f2431552a9a8e9d3f40e8d5d5"
+      NIX_INSTALLER_TAG="v3.21.9"
+      NODE_MAJOR="22"
+
+      ARCH="$(dpkg --print-architecture)"    # arm64 | amd64
+
+      fetch_verify() {   # url  sha256  dest
+        curl --proto '=https' --tlsv1.2 -fsSL -o "$3" "$1"
+        echo "$2  $3" | sha256sum -c - >/dev/null
+      }
+
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        ca-certificates curl wget gnupg git openssh-client \
+        build-essential pkg-config cmake \
+        python3 python3-pip python3-venv \
+        ripgrep fd-find jq unzip zip xz-utils zstd \
+        less vim nano tmux procps lsof rsync sqlite3 \
+        dnsutils net-tools
+
+      # GitHub CLI — signed apt repo
+      curl --proto '=https' --tlsv1.2 -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+      echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list
+
+      # Node.js 22 (toolchain) — from the signed apt repo rather than a
+      # `curl | bash` of the NodeSource setup script, so every package is
+      # verified against the repo key. (Redirect rather than `gpg -o`: -o
+      # prompts before overwriting, which would wedge this script when
+      # provisioning runs again on a later boot.)
+      #
+      # Coding agents are NOT installed here — the launcher installs them
+      # per-VM on first use from agents/<name>.conf, so existing VMs pick up new
+      # agents too (a template edit only reaches new ones). Each installs into
+      # $HOME and self-updates from there.
+      curl --proto '=https' --tlsv1.2 -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor > /usr/share/keyrings/nodesource.gpg
+      echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list
+
+      apt-get update
+      apt-get install -y --no-install-recommends gh nodejs
+
+      # Go — official tarball, pinned + checksummed
+      if [ ! -x /usr/local/go/bin/go ]; then
+        case "$ARCH" in
+          arm64) GO_SHA256="$GO_SHA256_arm64" ;;
+          amd64) GO_SHA256="$GO_SHA256_amd64" ;;
+          *) echo "no pinned Go checksum for arch $ARCH" >&2; exit 1 ;;
+        esac
+        GO_TGZ="$(mktemp)"
+        fetch_verify "https://go.dev/dl/go${GO_VER}.linux-${ARCH}.tar.gz" "$GO_SHA256" "$GO_TGZ"
+        rm -rf /usr/local/go
+        tar -C /usr/local -xzf "$GO_TGZ"
+        rm -f "$GO_TGZ"
+      fi
+
+      # Nim + Nimble — from source, pinned + checksummed
+      # (choosenim has no linux_arm64 build)
+      if [ ! -x /opt/nim/bin/nim ]; then
+        NIM_TXZ="$(mktemp)"
+        fetch_verify "https://nim-lang.org/download/nim-${NIM_VER}.tar.xz" "$NIM_SHA256" "$NIM_TXZ"
+        mkdir -p /opt/nim
+        tar -xJ -C /opt/nim --strip-components=1 -f "$NIM_TXZ"
+        rm -f "$NIM_TXZ"
+        cd /opt/nim
+        sh build.sh
+        ./bin/nim c --skipUserCfg --skipParentCfg -o:koch koch
+        ./koch boot -d:release
+        ./koch tools
+        rm -rf c_code nimcache
+        cd /
+      fi
+
+      # Nix — Determinate installer, pinned to a release tag (not the floating
+      # "latest" endpoint), systemd-managed daemon, flakes on
+      if [ ! -e /nix ]; then
+        curl --proto '=https' --tlsv1.2 -sSf -L "https://install.determinate.systems/nix/tag/${NIX_INSTALLER_TAG}" \
+          | sh -s -- install linux --no-confirm \
+              --extra-conf "experimental-features = nix-command flakes"
+      fi
+
+      # Ambient toolchain PATH for every login shell
+      cat > /etc/profile.d/claude-toolchains.sh <<'EOF'
+      export PATH="$HOME/.local/bin:/usr/local/go/bin:/opt/nim/bin:$HOME/.cargo/bin:$HOME/go/bin:$HOME/.nimble/bin:$PATH"
+      export GOPATH="$HOME/go"
+      export NIMBLE_DIR="$HOME/.nimble"
+      export IS_SANDBOX=1
+      # Advertise 24-bit color so tools like bat/delta/nvim don't downgrade to 256.
+      # limactl shell doesn't forward COLORTERM, so default it (honor a real one if sent).
+      export COLORTERM="${COLORTERM:-truecolor}"
+      EOF
+
+  # ---- per-user tools (run as the VM user, so installs are writable at runtime) ----
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      # Rust — pinned rustup-init, checksummed, instead of `curl | sh` of
+      # sh.rustup.rs. Installed into the user's home so `cargo install` works
+      # without sudo.
+      RUSTUP_VER="1.29.0"
+      RUSTUP_SHA256_arm64="9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792"
+      RUSTUP_SHA256_amd64="4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10"
+      if ! [ -x "$HOME/.cargo/bin/rustc" ]; then
+        ARCH="$(dpkg --print-architecture)"
+        case "$ARCH" in
+          arm64) TRIPLE="aarch64-unknown-linux-gnu"; RUSTUP_SHA256="$RUSTUP_SHA256_arm64" ;;
+          amd64) TRIPLE="x86_64-unknown-linux-gnu";  RUSTUP_SHA256="$RUSTUP_SHA256_amd64" ;;
+          *) echo "no pinned rustup checksum for arch $ARCH" >&2; exit 1 ;;
+        esac
+        RUSTUP_INIT="$(mktemp)"
+        curl --proto '=https' --tlsv1.2 -fsSL -o "$RUSTUP_INIT" \
+          "https://static.rust-lang.org/rustup/archive/${RUSTUP_VER}/${TRIPLE}/rustup-init"
+        echo "$RUSTUP_SHA256  $RUSTUP_INIT" | sha256sum -c - >/dev/null
+        chmod +x "$RUSTUP_INIT"
+        "$RUSTUP_INIT" -y --no-modify-path --profile default --default-toolchain stable
+        rm -f "$RUSTUP_INIT"
+      fi
+      mkdir -p "$HOME/workspace"
+
+# Readiness probe so `sandbox up` blocks until the toolchains are actually in.
+probes:
+  - description: "toolchains installed"
+    script: |
+      #!/bin/bash
+      set -eu
+      for t in go nim nimble gh; do
+        if ! timeout 300s bash -c "until command -v $t >/dev/null 2>&1 || [ -x /usr/local/go/bin/$t ] || [ -x /opt/nim/bin/$t ]; do sleep 3; done"; then
+          echo "probe: $t not found" >&2
+          exit 1
+        fi
+      done
+    hint: |
+      Toolchain provisioning did not finish. Check the guest log:
+      limactl shell <instance> sudo cat /var/log/cloud-init-output.log

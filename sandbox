@@ -1,0 +1,744 @@
+#!/usr/bin/env bash
+# Claude agent sandbox — one Lima VM per project.
+#
+#   sandbox new                      interactive setup: name, identities, tokens, VM, keys
+#   sandbox ls                       list all sandbox VMs
+#   sandbox agents                   list the agents this launcher knows about
+#   sandbox secret set  <name>       store a token in the macOS Keychain
+#   sandbox secret rm   <name>       remove a stored token
+#   sandbox <project>                start (if needed) and open the project's default agent
+#   sandbox <project> <agent>        open a specific agent (claude, opencode, ...)
+#   sandbox <project> agent          list agents and whether they're installed in the VM
+#   sandbox <project> agent install <name>        install an agent into the VM
+#   sandbox <project> agent default <name>        set the project's default agent
+#   sandbox <project> agent run <name> [args...]  run an agent (works even if its
+#                                                 name collides with a command)
+#   sandbox <project> shell          interactive shell in the VM
+#   sandbox <project> code [path]    open VS Code (Remote-SSH) in the VM
+#   sandbox <project> up             create/start the VM (auto-applies identities)
+#   sandbox <project> auth           (re)apply GitHub identities/tokens from config
+#   sandbox <project> keys           ensure GPG signing key, add to GitHub, verify
+#   sandbox <project> set-email <email>  change the git email (regenerates GPG signing key)
+#   sandbox <project> config [--edit]    show (or edit) the project's config file
+#   sandbox <project> audit          report which GitHub credential the VM holds
+#   sandbox <project> exec CMD...    run a command in the VM
+#   sandbox <project> status         show the VM status
+#   sandbox <project> stop           stop the VM (disk kept)
+#   sandbox <project> destroy        delete the VM and everything in it
+#
+# Project identities live in projects/<project>.conf; tokens live in the macOS
+# Keychain, never in the repo. `sandbox new` writes the config for you.
+#
+# Agents (Claude Code, OpenCode, ...) are described by agents/<name>.conf and
+# installed into the VM on first use — adding one is a new file, nothing here.
+#
+# Security note: the agent inside a VM runs with --dangerously-skip-permissions,
+# so the VM is untrusted by construction. Nothing from the host is mounted into
+# it, and anything the VM sends back to the host is validated here before use.
+set -euo pipefail
+
+ROOT="${AI_SANDBOX_ROOT:-$HOME/ai-sandbox}"
+TEMPLATE="$ROOT/lima/claude.yaml"
+HELPER_SRC="$ROOT/lima/cred-helper.sh"
+PROJECTS="$ROOT/projects"
+AGENTS="$ROOT/agents"
+PREFIX="claude-"
+KC_PREFIX="ai-sandbox"     # Keychain service prefix
+DEFAULT_AGENT="claude"
+
+# Commands are matched before the agent registry, so these names can never
+# resolve to an agent; `sandbox agents` warns if one is shadowed.
+BUILTIN_CMDS="up start auth keys set-email email shell code exec stop destroy delete status agent config conf audit"
+
+die() { echo "sandbox: $*" >&2; exit 1; }
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
+is_builtin() { case " $BUILTIN_CMDS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# --------------------------------------------------------------- validation
+# Values from the wizard, the CLI and *.conf all end up either in a file that is
+# later `source`d as shell code or in a path handed to another program, so they
+# are validated at the door rather than escaped at each use site.
+valid_ident()  { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$1" != *".."* ]]; }
+valid_ghuser() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; }
+valid_email()  { [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$ ]]; }
+valid_host()   { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; }
+# <host>/<org>, optionally deeper (<host>/<org>/<repo>) — cred-helper.sh
+# routes on the longest matching prefix, so deeper scopes are legal.
+valid_scope()  { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(/[A-Za-z0-9._-]+)+$ ]]; }
+# Free text (commit name): anything but control characters — it is single-quoted
+# when written to the config.
+valid_text()   { [ -n "$1" ] && [[ "$1" != *[[:cntrl:]]* ]]; }
+
+# Single-quote a value for safe embedding in a config file that gets `source`d.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# ------------------------------------------------------------------ secrets
+kc_service() { echo "${KC_PREFIX}:$1"; }
+secret_get() { security find-generic-password -s "$(kc_service "$1")" -a "$USER" -w 2>/dev/null; }
+secret_rm()  { security delete-generic-password -s "$(kc_service "$1")" -a "$USER" >/dev/null && echo ">> removed"; }
+# Store a token WITHOUT ever putting it in argv: `security` prompts on the tty
+# when -w is given no value. Passing the token as an argument would expose it to
+# any process running as this user (`ps`) — exactly the threat the Keychain is
+# there to reduce.
+secret_put() {
+    local name="$1" svc check; svc="$(kc_service "$name")"
+    security add-generic-password -U -s "$svc" -a "$USER" -w || die "keychain write failed for $svc"
+    check="$(secret_get "$name" || true)"
+    [ -n "$check" ] || die "nothing stored for $svc (empty token?)"
+}
+secret_set() { # interactive: `security` prompts (hidden), then stores
+    local name="$1"
+    valid_ident "$name" || die "invalid secret name '$name' — use letters, digits, '.', '_', '-'"
+    echo "Token for \"$name\" — 'security' will prompt for it (hidden, never on the command line)." >&2
+    secret_put "$name"
+    echo ">> stored in Keychain as $(kc_service "$name")"
+}
+
+# ------------------------------------------------------- project identity DSL
+# projects/<name>.conf calls add_identity; records collected in $_IDENTITIES,
+# one line per identity with fields in this order:
+#   github_username | git_name | git_email | github_host | keychain | org_scopes
+# The separator is US (0x1f), not TAB: tab counts as IFS whitespace, so `read`
+# would collapse two adjacent tabs into one and shift every later field of an
+# identity that omits --git-name or --git-email — silently pointing the Keychain
+# lookup and `gh auth login --hostname` at the wrong values.
+_IFS_REC=$'\037'
+_IDENTITIES=""
+add_identity() {
+    local ghuser="" gname="" gemail="" ghost="github.com" kc="" scopes="" s
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --github-username) ghuser="$2"; shift 2 ;;
+            --git-name)        gname="$2";  shift 2 ;;
+            --git-email)       gemail="$2"; shift 2 ;;
+            --github-host)     ghost="$2";  shift 2 ;;
+            --token-keychain)  kc="$2";     shift 2 ;;
+            --org-scope)       scopes="$scopes $2"; shift 2 ;;
+            *) die "add_identity: unknown arg '$1'" ;;
+        esac
+    done
+    [ -n "$ghuser" ] || die "add_identity: --github-username required"
+    [ -n "$kc" ]     || die "add_identity ($ghuser): --token-keychain required"
+    # A hand-edited config is still shell code, but these values are also spliced
+    # into paths and remote commands — keep them boring.
+    valid_ghuser "$ghuser" || die "add_identity: invalid --github-username '$ghuser'"
+    valid_ident  "$kc"     || die "add_identity ($ghuser): invalid --token-keychain '$kc'"
+    valid_host   "$ghost"  || die "add_identity ($ghuser): invalid --github-host '$ghost'"
+    [ -z "$gname" ]  || valid_text  "$gname"  || die "add_identity ($ghuser): invalid --git-name"
+    [ -z "$gemail" ] || valid_email "$gemail" || die "add_identity ($ghuser): invalid --git-email '$gemail'"
+    for s in $scopes; do
+        valid_scope "$s" || die "add_identity ($ghuser): invalid --org-scope '$s' (expected <host>/<org>[/...])"
+    done
+    _IDENTITIES="${_IDENTITIES}${ghuser}${_IFS_REC}${gname}${_IFS_REC}${gemail}${_IFS_REC}${ghost}${_IFS_REC}${kc}${_IFS_REC}${scopes}
+"
+}
+# projects/<name>.conf may also call `use_agent <name>` to pick the agent that
+# a bare `sandbox <project>` opens. Absent => DEFAULT_AGENT.
+_AGENT=""
+use_agent() { _AGENT="$1"; }
+
+# Resolve a path to the file it finally points at. The checks below must apply
+# to what actually gets sourced, not to a symlink standing in front of it:
+# `find` does not follow links (-P is the default) and a macOS symlink is 0755,
+# so checking the link itself would happily wave through a world-writable
+# target. Resolving also means we source the real path, closing the gap between
+# the check and the `source`.
+resolve_path() {
+    local f="$1" t d i=0
+    d="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || return 1
+    f="$d/$(basename "$f")"
+    while [ -L "$f" ]; do
+        i=$((i+1)); [ "$i" -le 20 ] || return 1     # symlink loop
+        t="$(readlink "$f")" || return 1
+        case "$t" in /*) ;; *) t="$(dirname "$f")/$t" ;; esac
+        d="$(cd "$(dirname "$t")" 2>/dev/null && pwd -P)" || return 1
+        f="$d/$(basename "$t")"
+    done
+    printf '%s' "$f"
+}
+
+# A project config is shell code that this script executes. Refuse to run one
+# that anybody but the owner can modify.
+check_conf_perms() {
+    # `find` rather than `stat`: the two stat dialects disagree on -f/-c and the
+    # wrong one silently succeeds with garbage.
+    local f="$1"
+    if [ -z "$(find "$f" -maxdepth 0 -user "$(id -un)" 2>/dev/null)" ]; then
+        die "$f is not owned by you — refusing to source it"
+    fi
+    if [ -n "$(find "$f" -maxdepth 0 \( -perm -g+w -o -perm -o+w \) 2>/dev/null)" ]; then
+        die "$f is group/world-writable and is executed as shell code — run: chmod 600 $f"
+    fi
+}
+# Echo the vetted, fully-resolved path of a project config, or die.
+conf_path() {
+    local f="$1" real
+    real="$(resolve_path "$f")" || die "cannot resolve $f (symlink loop?)"
+    [ -f "$real" ] || die "$f does not point at a regular file"
+    check_conf_perms "$real"
+    printf '%s' "$real"
+}
+load_project() {
+    _IDENTITIES=""; _AGENT=""
+    local f="$PROJECTS/$1.conf" real
+    [ -f "$f" ] || return 0
+    real="$(conf_path "$f")" || exit 1
+    # shellcheck source=/dev/null
+    source "$real"
+}
+primary_record() { printf '%s' "$_IDENTITIES" | sed -n '1p'; }
+project_agent() { load_project "$1"; printf '%s' "${_AGENT:-$DEFAULT_AGENT}"; }
+
+# --------------------------------------------------------------- agent registry
+# agents/<name>.conf declares how to install and launch one coding agent.
+# Values are run inside the VM, so '$HOME' must stay single-quoted in the conf —
+# it is expanded by the VM's shell, not here.
+_A_DESC=""; _A_BIN=""; _A_PATHS=""; _A_INSTALL=""; _A_SETUP=""; _A_LAUNCH=""
+agent_desc()    { _A_DESC="$1"; }
+agent_bin()     { _A_BIN="$1"; }
+agent_path()    { _A_PATHS="$_A_PATHS $1"; }
+agent_install() { _A_INSTALL="$1"; }
+agent_setup()   { _A_SETUP="$1"; }
+agent_launch()  { _A_LAUNCH="$1"; }
+
+# Classify a GitHub credential by its prefix. Only fine-grained PATs are bound
+# to one owner with explicit per-repo permissions; the rest are account-wide.
+token_kind() {
+    case "${1:-}" in
+        github_pat_*) echo "fine-grained" ;;
+        ghp_*)        echo "classic" ;;
+        gho_*)        echo "oauth" ;;
+        ghu_*)        echo "oauth-user" ;;
+        ghs_*)        echo "app-installation" ;;
+        ghr_*)        echo "refresh" ;;
+        "")           echo "none" ;;
+        *)            echo "unknown" ;;
+    esac
+}
+token_is_narrow() { [ "$(token_kind "${1:-}")" = "fine-grained" ]; }
+
+# Known projects = those with a config, plus any existing VM (config-less ones).
+project_list() {
+    { ls "$PROJECTS"/*.conf 2>/dev/null | sed 's|.*/||; s|\.conf$||'
+      limactl list -q 2>/dev/null | sed -n "s|^${PREFIX}||p"
+    } | sort -u
+}
+agent_exists() { [ -n "${1:-}" ] && [ -f "$AGENTS/$1.conf" ]; }
+agent_list()   { ls "$AGENTS"/*.conf 2>/dev/null | sed 's|.*/||; s|\.conf$||' || true; }
+load_agent() {
+    _A_DESC=""; _A_BIN=""; _A_PATHS=""; _A_INSTALL=""; _A_SETUP=""; _A_LAUNCH=""
+    agent_exists "$1" || die "unknown agent '$1' (see: sandbox agents)"
+    source "$AGENTS/$1.conf"
+    [ -n "$_A_BIN" ]    || die "agents/$1.conf: agent_bin is required"
+    [ -n "$_A_LAUNCH" ] || die "agents/$1.conf: agent_launch is required"
+}
+
+# PATH prelude for a loaded agent, expanded inside the VM.
+agent_prelude() { local p out=""; for p in $_A_PATHS; do out="${out}export PATH=\"$p:\$PATH\"; "; done; printf '%s' "$out"; }
+agent_installed() { vm bash -lc "$(agent_prelude)command -v $_A_BIN >/dev/null 2>&1" </dev/null >/dev/null 2>&1; }
+
+# Install on first use, so VMs created before an agent existed still get it —
+# a Lima template edit would only ever reach *new* VMs.
+ensure_agent() {
+    local name="$1"
+    load_agent "$name"
+    agent_installed && return 0
+    [ -n "$_A_INSTALL" ] || die "agent '$name' is not installed and agents/$name.conf has no agent_install"
+    echo ">> installing agent '$name' in $INST (first use, one time)..."
+    vm bash -lc "$_A_INSTALL" </dev/null || die "install failed for agent '$name'"
+    if [ -n "$_A_SETUP" ]; then
+        vm bash -lc "$(agent_prelude)$_A_SETUP" </dev/null || die "post-install setup failed for agent '$name'"
+    fi
+    # Register the agent's PATH for every login shell, so `shell`, `exec` and
+    # remote IDEs see it too — not just the launcher.
+    if [ -n "$_A_PATHS" ]; then
+        printf '%s\n' "$(agent_prelude)" \
+            | vm bash -lc "set -e; t=\"\$(mktemp)\"; cat > \"\$t\"; sudo install -m 0644 -o root -g root \"\$t\" /etc/profile.d/sandbox-agent-$name.sh; rm -f \"\$t\""
+    fi
+    agent_installed || die "agent '$name' still not on PATH after install"
+    echo ">> agent '$name' ready."
+}
+
+run_agent() { # $1=agent, rest = args passed through to it
+    local name="$1"; shift
+    ensure_agent "$name"
+    # Forward the host terminal's identity so the agent's TUI applies the right
+    # key handling (Shift/Alt+Enter, truecolor); SSH strips these vars.
+    local envargs=()
+    if [ -n "${TERM_PROGRAM:-}" ];         then envargs+=("TERM_PROGRAM=$TERM_PROGRAM"); fi
+    if [ -n "${TERM_PROGRAM_VERSION:-}" ]; then envargs+=("TERM_PROGRAM_VERSION=$TERM_PROGRAM_VERSION"); fi
+    if [ -n "${COLORTERM:-}" ];            then envargs+=("COLORTERM=$COLORTERM"); fi
+    exec limactl shell "$INST" \
+        env ${envargs[@]+"${envargs[@]}"} \
+        bash -lc "$(agent_prelude)cd ~/workspace 2>/dev/null || cd ~; $_A_LAUNCH" _ "$@"
+}
+
+# --------------------------------------------------------------- VM lifecycle
+exists()  { limactl list -q 2>/dev/null | grep -qx "$INST"; }
+running() { [ "$(limactl list "$INST" --format '{{.Status}}' 2>/dev/null)" = "Running" ]; }
+vm()      { limactl shell "$INST" "$@"; }   # run a program in the VM
+
+ensure_up() {
+    if ! exists; then
+        echo ">> creating VM '$INST' (first run provisions toolchains — a few minutes)..."
+        limactl start --name "$INST" --tty=false "$TEMPLATE"
+        configure_identities   # auto-apply project auth on first create
+    elif ! running; then
+        limactl start "$INST"
+    fi
+}
+
+configure_identities() { # assumes VM is up
+    load_project "$PROJECT"
+    if [ -z "$(printf '%s' "$_IDENTITIES" | tr -d ' \t\n')" ]; then
+        echo ">> no identities in $PROJECTS/$PROJECT.conf — run: sandbox new $PROJECT"
+        return 0
+    fi
+    # Pass 1 — resolve every token on the host BEFORE touching the VM. The reset
+    # below is destructive, so discovering a missing Keychain item afterwards
+    # would leave the VM with no working credentials at all: worse than the stale
+    # ones we set out to clear.
+    local users=() names=() emails=() hosts=() tokens=() oscopes=() kcs=() n=0
+    while IFS="$_IFS_REC" read -r ghuser gname gemail ghost kc scopes; do
+        [ -n "$ghuser" ] || continue
+        local token=""
+        if ! token="$(secret_get "$kc")"; then
+            # The first configured identity is the primary; without it there is
+            # no git identity, no active gh account and no signing key owner.
+            [ "$n" -gt 0 ] || die "primary identity $ghuser: Keychain item $(kc_service "$kc") not found — run: sandbox secret set $kc (nothing in the VM was changed)"
+            echo "   !! skipping $ghuser: Keychain item $(kc_service "$kc") not found (sandbox secret set $kc)"
+            continue
+        fi
+        users[$n]="$ghuser"; names[$n]="$gname";  emails[$n]="$gemail"
+        hosts[$n]="$ghost";  tokens[$n]="$token"; oscopes[$n]="$scopes"; kcs[$n]="$kc"
+        n=$((n+1))
+    done <<EOF
+$_IDENTITIES
+EOF
+    [ "$n" -gt 0 ] || die "no usable identities for '$PROJECT'"
+
+    # Pass 2 — install the per-scope credential helper (root-owned, staged
+    # through a private temp file rather than a predictable path), then reset
+    # *both* token stores. Dropping gh's hosts.yml matters: without it, an
+    # identity removed from the config — or a rotated token — keeps working
+    # inside the VM forever.
+    vm bash -lc 'set -e; t="$(mktemp)"; cat > "$t"; sudo install -m 0755 -o root -g root "$t" /usr/local/bin/git-credential-sandbox; rm -f "$t"' < "$HELPER_SRC"
+    vm bash -lc 'rm -f ~/.config/gh/hosts.yml; mkdir -p ~/.config/sandbox && chmod 700 ~/.config/sandbox && : > ~/.config/sandbox/credentials && chmod 600 ~/.config/sandbox/credentials' </dev/null
+
+    local i=0 scope scope_list
+    while [ "$i" -lt "$n" ]; do
+        echo ">> [${users[$i]}@${hosts[$i]}] gh auth + git credentials"
+        if ! token_is_narrow "${tokens[$i]}"; then
+            echo "   !! WIDE TOKEN: '${kcs[$i]}' is a $(token_kind "${tokens[$i]}") token, not a fine-grained PAT."
+            echo "      It grants this VM broad access to your account. Prefer a fine-grained"
+            echo "      PAT scoped to this project's repos.  Details: sandbox $PROJECT audit"
+        fi
+        if ! printf '%s' "${tokens[$i]}" | vm env GH_HOST="${hosts[$i]}" bash -lc 'gh auth login --hostname "$GH_HOST" --with-token' 2>/dev/null; then
+            echo "   !! gh auth login failed for ${users[$i]} (token valid? needs repo/read:org)"
+        fi
+        scope_list=()
+        read -ra scope_list <<<"${oscopes[$i]}"   # split on whitespace, no globbing
+        for scope in ${scope_list[@]+"${scope_list[@]}"}; do
+            printf '%s\t%s\n' "$scope" "${tokens[$i]}" | vm bash -lc 'cat >> ~/.config/sandbox/credentials'
+        done
+        i=$((i+1))
+    done
+
+    # The primary is the first *configured* identity, never whichever one
+    # happened to resolve first.
+    if [ -n "${names[0]}" ];  then vm git config --global user.name  "${names[0]}"  </dev/null; fi
+    if [ -n "${emails[0]}" ]; then vm git config --global user.email "${emails[0]}" </dev/null; fi
+    vm env GH_HOST="${hosts[0]}" PRIMARY="${users[0]}" bash -lc '
+        git config --global credential.useHttpPath true
+        git config --global --replace-all credential.helper "sandbox"
+        gh auth setup-git --hostname "$GH_HOST" 2>/dev/null || true
+        gh auth switch --hostname "$GH_HOST" --user "$PRIMARY" 2>/dev/null || true
+    ' </dev/null
+
+    # Pin gh to the project's PAT via GH_TOKEN: the env var outranks
+    # ~/.config/gh/hosts.yml, so a stray `gh auth login` (wide OAuth token)
+    # cannot take effect. Only for single-identity projects — with several
+    # identities gh must stay switchable between accounts.
+    if [ "$n" = 1 ]; then
+        printf '%s' "${tokens[0]}" | vm bash -lc \
+            'umask 077; mkdir -p ~/.config/sandbox; cat > ~/.config/sandbox/gh-token'
+        vm bash -lc 'sudo tee /etc/profile.d/ai-sandbox-gh.sh >/dev/null' <<'EOF'
+# ai-sandbox: pin gh to this project's PAT. GH_TOKEN outranks the token
+# stored by `gh auth login`, so an accidental wide/OAuth login can't take over.
+[ -r "$HOME/.config/sandbox/gh-token" ] && export GH_TOKEN="$(cat "$HOME/.config/sandbox/gh-token")"
+EOF
+        echo ">> gh pinned to the project PAT (GH_TOKEN) — a stray 'gh auth login' won't take effect"
+    else
+        vm bash -lc 'sudo rm -f /etc/profile.d/ai-sandbox-gh.sh; rm -f ~/.config/sandbox/gh-token' </dev/null
+        echo ">> multiple identities — gh left switchable (GH_TOKEN not pinned)"
+    fi
+    echo ">> identities applied for '$PROJECT' (primary: ${users[0]})"
+}
+
+# ---------------------------------------------------- GPG commit signing key
+setup_keys() { # assumes VM is up; uses the primary identity
+    load_project "$PROJECT"
+    local rec; rec="$(primary_record)"
+    [ -n "$rec" ] || die "no identities in $PROJECTS/$PROJECT.conf — run: sandbox new $PROJECT"
+    local ghuser gname gemail ghost kc scopes
+    IFS="$_IFS_REC" read -r ghuser gname gemail ghost kc scopes <<<"$rec"
+    [ -n "$gname" ]  || gname="$ghuser"
+    [ -n "$gemail" ] || die "primary identity has no --git-email; GPG signing needs one"
+
+    echo ">> [$ghuser@$ghost] GPG signing key in $INST"
+    local keyid
+    keyid="$(vm env GNAME="$gname" EMAIL="$gemail" bash -s < "$ROOT/lima/setup-keys.sh")"
+    [ -n "$keyid" ] || die "key setup failed in the VM"
+    echo "   GPG signing key: $keyid  (commits + tags will be signed)"
+
+    # GitHub matches GPG keys by fingerprint and ignores a re-upload of a key it
+    # already stores — including the renewed expiry — so the stored copy has to
+    # be deleted first for a renewal to take effect. Removing it is safe for
+    # history: per GitHub's docs, commits already verified stay verified after
+    # the public key is removed.
+    local upload
+    upload="$(vm env GH_HOST="$ghost" KEYID="$keyid" bash -lc '
+        old=$(gh api user/gpg_keys --jq ".[] | select(.key_id==env.KEYID) | .id" 2>/dev/null | head -1)
+        if [ -n "$old" ]; then
+            gh api -X DELETE "user/gpg_keys/$old" >/dev/null 2>&1 || { echo replace-denied; exit 0; }
+        fi
+        if gpg --armor --export "$KEYID" | gh gpg-key add - >/dev/null 2>&1; then
+            if [ -n "$old" ]; then echo renewed; else echo added; fi
+        else
+            if [ -n "$old" ]; then echo lost; else echo denied; fi
+        fi' </dev/null 2>/dev/null || echo denied)"
+    case "$upload" in
+        added)   echo "   uploaded GPG signing key to $ghost" ;;
+        renewed) echo "   replaced the stored key on $ghost so the new expiry takes effect" ;;
+        lost)    echo "   !! removed the old key from $ghost but could not upload the new one —"
+                 echo "      add it now, or commits will show Unverified:" ;;
+        replace-denied)
+                 echo "   !! $ghost already stores this key and it could not be replaced, so any"
+                 echo "      renewed expiry has NOT taken effect there (the token needs 'GPG keys'"
+                 echo "      write permission). Delete the old key and add this one:" ;;
+        *)       echo "   !! gh could not add the GPG key (token lacks 'GPG keys' write permission)" ;;
+    esac
+    case "$upload" in
+        added|renewed) ;;
+        *) echo ">> add it manually at https://$ghost/settings/gpg/new :"
+           vm env KEYID="$keyid" bash -lc 'gpg --armor --export "$KEYID"' </dev/null ;;
+    esac
+
+    printf ">> test — local GPG-signed commit: "
+    vm bash -lc 'T=$(mktemp -d); cd "$T"; git init -q; git commit -q --allow-empty -m t; \
+        git log --show-signature -1 2>&1 | grep -qi "good signature" && echo OK || echo FAILED; \
+        cd /; rm -rf "$T"' </dev/null
+
+    printf ">> verify — key registered on %s (via PAT): " "$ghost"
+    vm env GH_HOST="$ghost" KEYID="$keyid" EMAIL="$gemail" PROJ="$PROJECT" bash -lc '
+        if gh api user/gpg_keys --jq ".[].key_id" 2>/dev/null | grep -qx "$KEYID"; then
+            echo "yes — commits by <$EMAIL> will show Verified (if that email is verified on the account)"
+        else
+            echo "no — add the key above, then re-run: sandbox $PROJ keys"
+        fi' </dev/null
+    # The key lives in a VM an untrusted agent can read, so it is deliberately
+    # short-lived: an exfiltrated key stops being able to forge signatures.
+    # (setup-keys.sh reports the expiry date on stderr as it sets it.)
+    echo "   renew the signing key any time with:  sandbox $PROJECT keys"
+}
+
+# ----------------------------------------------------------------- new wizard
+# A failed read means EOF (^D / no tty): give up instead of re-prompting forever.
+ask()    { local p="$1" d="${2:-}" a; read -rp "$p${d:+ [$d]}: " a || { echo >&2; die "cancelled"; }; printf '%s' "${a:-$d}"; }
+confirm(){ local a; read -rp "$1 [$2]: " a; a="${a:-$2}"; [[ "$a" =~ ^[Yy] ]]; }
+
+new_project() {
+    mkdir -p "$PROJECTS"
+    local proj conf default="${1:-}"
+    while :; do
+        proj="$(ask 'Project name' "$default")"; default=""
+        [ -n "$proj" ] || { echo "  a name is required." >&2; continue; }
+        valid_ident "$proj" || { echo "  invalid name — use letters, digits, '.', '_', '-'." >&2; continue; }
+        conf="$PROJECTS/$proj.conf"
+        [ -f "$conf" ] && { echo "  '$proj' already exists ($conf) — pick another name, or run: sandbox $proj auth" >&2; continue; }
+        break
+    done
+
+    echo "New project '$proj'. Config saved to $conf; tokens go to the Keychain."
+    echo
+    local ghuser gname gemail kc
+    while :; do
+        ghuser="$(ask 'Primary GitHub username')"
+        [ -n "$ghuser" ] || die "username required"      # also breaks the loop on EOF
+        valid_ghuser "$ghuser" && break
+        echo "  not a valid GitHub username." >&2
+    done
+    while :; do
+        gname="$(ask 'Git commit name' "$ghuser")"
+        valid_text "$gname" && break
+        echo "  the name cannot be empty or contain control characters." >&2
+    done
+    while :; do
+        gemail="$(ask 'Git commit email')"
+        [ -n "$gemail" ] || die "commit email required"   # also breaks the loop on EOF
+        valid_email "$gemail" && break
+        echo "  not a valid email address." >&2
+    done
+    echo "Create a fine-grained PAT (Contents + Pull requests; add 'GPG keys' for auto signing-key upload):"
+    echo "  https://github.com/settings/personal-access-tokens/new"
+    kc="$proj-$ghuser"
+    echo "Token for $ghuser — 'security' will prompt for it (hidden, never on the command line)."
+    secret_put "$kc"
+    # Every value is single-quoted: this file is `source`d as shell code.
+    {
+        echo "# $proj — generated by 'sandbox new' on $(date +%Y-%m-%d)"
+        echo "add_identity \\"
+        echo "  --github-username $(shq "$ghuser") \\"
+        echo "  --git-name        $(shq "$gname") \\"
+        echo "  --git-email       $(shq "$gemail") \\"
+        echo "  --token-keychain  $(shq "$kc")"
+    } > "$conf"
+    chmod 600 "$conf"
+
+    while confirm "Add another identity for a specific org?" "N"; do
+        local xuser xscope xkc
+        xuser="$(ask '  GitHub username')"
+        if ! valid_ghuser "$xuser"; then echo "  not a valid GitHub username, skipping." >&2; continue; fi
+        xscope="$(ask '  Org scope (host/org, e.g. github.com/some-org)')"
+        if ! valid_scope "$xscope"; then echo "  not a valid <host>/<org>[/...] scope, skipping." >&2; continue; fi
+        xkc="$proj-$xuser"
+        echo "  Token for $xuser — 'security' will prompt for it (hidden)."
+        secret_put "$xkc"
+        { echo; echo "add_identity \\"; echo "  --github-username $(shq "$xuser") \\";
+          echo "  --token-keychain  $(shq "$xkc") \\"; echo "  --org-scope       $(shq "$xscope")"; } >> "$conf"
+    done
+
+    local agent
+    echo; echo "Agents available: $(agent_list | tr '\n' ' ')"
+    while :; do
+        agent="$(ask 'Default agent' "$DEFAULT_AGENT")"
+        agent_exists "$agent" && break
+        echo "  unknown agent '$agent' — pick one of: $(agent_list | tr '\n' ' ')" >&2
+    done
+    { echo; echo "# agent opened by a bare 'sandbox $proj'"; echo "use_agent $agent"; } >> "$conf"
+
+    echo; echo "Wrote $conf"
+    PROJECT="$proj"; INST="${PREFIX}${proj}"
+    confirm "Create and provision the VM now (~5-10 min)?" "Y" || { echo "Later: sandbox $proj up"; return 0; }
+    ensure_up
+    confirm "Generate GPG signing key and add to GitHub?" "Y" && setup_keys
+    # Pre-warm so the first launch isn't waiting on a download. Subshell: a failed
+    # install shouldn't abort the wizard after the VM and keys are already set up.
+    ( ensure_agent "$agent" ) || echo ">> agent install failed — retry with: sandbox $proj agent install $agent"
+    echo; echo ">> '$proj' ready.  Run:  sandbox $proj"
+}
+
+# ------------------------------------------------------------------- dispatch
+case "${1:-}" in
+    ""|-h|--help|help) usage; exit 0 ;;
+    new) new_project "${2:-}"; exit 0 ;;
+    ls|list)
+        echo "sandbox VMs:"
+        limactl list 2>/dev/null | awk -v p="^${PREFIX}" 'NR==1 || $1 ~ p' || true
+        exit 0 ;;
+    agents)
+        echo "agents (agents/*.conf, default: $DEFAULT_AGENT):"
+        for a in $(agent_list); do
+            load_agent "$a"
+            printf '  %-12s %s\n' "$a" "$_A_DESC"
+            is_builtin "$a" && echo "               !! name collides with a command — reach it via: sandbox <project> agent run $a"
+        done
+        echo
+        echo "per-VM install status:  sandbox <project> agent"
+        exit 0 ;;
+    secret)
+        sub="${2:-}"; name="${3:-}"
+        [ -n "$name" ] || die "usage: sandbox secret set|rm <name>"
+        valid_ident "$name" || die "invalid secret name: $name"
+        case "$sub" in
+            set) secret_set "$name" ;;
+            rm|remove|delete) secret_rm "$name" ;;
+            *) die "usage: sandbox secret set|rm <name>" ;;
+        esac
+        exit 0 ;;
+esac
+
+PROJECT="$1"; shift || true
+valid_ident "$PROJECT" || die "invalid project name: $PROJECT"
+INST="${PREFIX}${PROJECT}"
+CMD="${1:-$(project_agent "$PROJECT")}"; shift || true
+
+# Typo guard: never provision a VM for a project we've never heard of. A project
+# is known if it has a config or an existing VM. ('config' is exempt so it can
+# still report what's missing; 'sandbox new' creates projects.)
+case "$CMD" in
+    config|conf) ;;
+    *) if [ ! -f "$PROJECTS/$PROJECT.conf" ] && ! exists; then
+           die "unknown project '$PROJECT' — no config ($PROJECTS/$PROJECT.conf) and no VM '$INST'
+  known projects: $(project_list | tr '\n' ' ')
+  create it with:  sandbox new $PROJECT"
+       fi ;;
+esac
+
+case "$CMD" in
+    up|start) ensure_up; echo ">> $INST running." ;;
+    auth)     ensure_up; configure_identities ;;
+    keys)     ensure_up; setup_keys ;;
+    set-email|email)
+        new_email="${1:-}"
+        [ -n "$new_email" ] || die "usage: sandbox $PROJECT set-email <email>"
+        valid_email "$new_email" || die "not a valid email: $new_email"
+        conf="$PROJECTS/$PROJECT.conf"
+        [ -f "$conf" ] || die "no config $conf — run: sandbox new $PROJECT"
+        # Rewrite the real file, so a config symlinked from a dotfiles checkout
+        # keeps its symlink instead of being replaced by a regular file.
+        conf="$(conf_path "$conf")" || exit 1
+        # Rewrite the primary identity's --git-email (first occurrence). The
+        # replacement is single-quoted (the file is shell code) and '&' / '\'
+        # are escaped so awk cannot expand them into the matched text.
+        tmp="$(mktemp)"
+        awk -v new="$(shq "$new_email")" '
+            BEGIN { gsub(/[\\&]/, "\\\\&", new) }
+            !done && /--git-email[[:space:]]+[^[:space:]]+/ { sub(/--git-email[[:space:]]+[^[:space:]]+/, "--git-email " new); done=1 }
+            { print }
+            END { if (!done) exit 3 }' "$conf" > "$tmp" \
+            || { rm -f "$tmp"; die "primary identity has no --git-email line in $conf; add one and retry"; }
+        mv "$tmp" "$conf" || { rm -f "$tmp"; die "could not update $conf"; }  # atomic: never leave
+        chmod 600 "$conf"                                                     # a half-written config
+        echo ">> git email set to $new_email in $conf"
+        ensure_up
+        setup_keys   # regenerates the GPG signing key for the new email + re-points signing
+        ;;
+    shell)    ensure_up; exec limactl shell "$INST" ;;
+    code)     ensure_up
+              command -v code >/dev/null 2>&1 || die "VS Code 'code' CLI not on PATH (install it / enable 'code' command)"
+              ide_home="$(limactl shell "$INST" printenv HOME 2>/dev/null)"
+              exec code --remote "ssh-remote+lima-${INST}" "${ide_home:-/home/$USER}/${1:-workspace}" ;;
+    agent)
+        sub="${1:-ls}"; shift || true
+        case "$sub" in
+            ls|list)
+                ensure_up
+                echo "agents in '$INST' (default: $(project_agent "$PROJECT")):"
+                for a in $(agent_list); do
+                    load_agent "$a"
+                    if agent_installed; then st="installed"; else st="not installed"; fi
+                    printf '  %-12s %-14s %s\n' "$a" "$st" "$_A_DESC"
+                done ;;
+            install)
+                [ $# -gt 0 ] || die "usage: sandbox $PROJECT agent install <name>"
+                ensure_up; ensure_agent "$1" ;;
+            default|use)
+                new_agent="${1:-}"
+                [ -n "$new_agent" ] || die "usage: sandbox $PROJECT agent default <name>"
+                agent_exists "$new_agent" || die "unknown agent '$new_agent' (see: sandbox agents)"
+                conf="$PROJECTS/$PROJECT.conf"
+                [ -f "$conf" ] || die "no config $conf — run: sandbox new $PROJECT"
+                conf="$(conf_path "$conf")" || exit 1   # vet + follow symlinks, as set-email does
+                tmp="$(mktemp)"
+                awk -v a="$new_agent" '
+                    /^[[:space:]]*use_agent[[:space:]]/ { if (!done) { print "use_agent " a; done=1 } next }
+                    { print }
+                    END { if (!done) { print ""; print "use_agent " a } }' "$conf" > "$tmp"
+                mv "$tmp" "$conf" || { rm -f "$tmp"; die "could not update $conf"; }
+                chmod 600 "$conf"
+                echo ">> default agent for '$PROJECT' is now '$new_agent' ($conf)" ;;
+            run)
+                [ $# -gt 0 ] || die "usage: sandbox $PROJECT agent run <name> [args...]"
+                agent_run_name="$1"; shift
+                ensure_up; run_agent "$agent_run_name" "$@" ;;
+            *) die "usage: sandbox $PROJECT agent [ls|install <name>|default <name>|run <name> ...]" ;;
+        esac ;;
+    exec)     ensure_up; [ $# -gt 0 ] || die "exec needs a command"
+              if [ $# -eq 1 ]; then
+                  exec limactl shell "$INST" bash -lc "$1"                  # documented: exec 'go test ./...'
+              else
+                  exec limactl shell "$INST" bash -lc 'exec "$@"' _ "$@"    # keep each argument intact
+              fi ;;
+    stop)     limactl stop "$INST" ;;
+    destroy|delete)
+        exists || die "no VM '$INST' to destroy"
+        echo "!! '$INST' and everything in it (code, tokens, GPG signing key) will be permanently deleted — this cannot be undone."
+        printf "   Type the project name '%s' to confirm: " "$PROJECT"
+        read -r ans || true
+        [ "$ans" = "$PROJECT" ] || die "aborted — name did not match"
+        limactl delete -f "$INST"; echo ">> $INST deleted." ;;
+    status)   limactl list "$INST" 2>/dev/null || echo "(no VM '$INST')" ;;
+    audit)
+        echo "project: $PROJECT   VM: $INST"
+        echo "--- configured tokens (host Keychain) ---"
+        load_project "$PROJECT"
+        if [ -z "$(printf '%s' "$_IDENTITIES" | tr -d ' \t\n')" ]; then
+            echo "  (no identities in $PROJECTS/$PROJECT.conf)"
+        else
+            while IFS="$_IFS_REC" read -r ghuser gname gemail ghost kc scopes; do
+                [ -n "$ghuser" ] || continue
+                if t="$(secret_get "$kc")"; then k="$(token_kind "$t")"; else k="MISSING from Keychain"; fi
+                case "$k" in
+                    fine-grained) mark="ok  " ;;
+                    "MISSING"*)   mark="??  " ;;
+                    *)            mark="WIDE" ;;
+                esac
+                printf '  [%s] %-28s %s  (%s)\n' "$mark" "$kc" "$k" "$ghuser@$ghost"
+            done <<EOF
+$_IDENTITIES
+EOF
+        fi
+        echo "--- live credential in the VM ---"
+        if ! running; then
+            echo "  (VM not running — start it with: sandbox $PROJECT up)"
+            exit 0
+        fi
+        vm bash -l -s <<'EOF'
+tok="$(gh auth token 2>/dev/null)"
+case "$tok" in
+  github_pat_*) kind="fine-grained (limited)" ;;
+  ghp_*)        kind="CLASSIC PAT (account-wide, scope-based)" ;;
+  gho_*|ghu_*)  kind="OAUTH (full account access!)" ;;
+  ghs_*)        kind="app installation" ;;
+  "")           kind="none — gh not authenticated" ;;
+  *)            kind="unknown" ;;
+esac
+echo "  gh token        : ${tok:0:12}...  -> $kind"
+echo "  source          : $(gh auth status 2>&1 | grep -qi 'GH_TOKEN\|environment' && echo 'GH_TOKEN env (pinned)' || echo '~/.config/gh/hosts.yml')"
+echo "  GH_TOKEN pinned : $([ -n "${GH_TOKEN:-}" ] && echo yes || echo no)"
+scopes="$(gh api -i user 2>/dev/null | sed -nE 's/^[Xx]-[Oo]auth-[Ss]copes: *//p' | tr -d '\r')"
+echo "  oauth scopes    : ${scopes:-(none — fine-grained PAT)}"
+echo "  gh account      : $(gh api user --jq .login 2>/dev/null || echo unknown)"
+echo "  git identity    : $(git config --global user.name) <$(git config --global user.email)>"
+echo "  credential helper: $(git config --global credential.helper)"
+echo "  scoped creds    : $(wc -l < ~/.config/sandbox/credentials 2>/dev/null || echo 0) org route(s)"
+EOF
+        ;;
+    config|conf)
+        cfg="$PROJECTS/$PROJECT.conf"
+        case "${1:-}" in
+            -e|--edit)
+                [ -f "$cfg" ] || die "no config at $cfg — create it with: sandbox new $PROJECT"
+                exec "${EDITOR:-vi}" "$cfg" ;;
+            -p|--path) echo "$cfg"; exit 0 ;;
+        esac
+        echo "config: $cfg"
+        if [ ! -f "$cfg" ]; then
+            echo "status: MISSING — '$PROJECT' runs unconfigured (no gh auth, git identity or GPG signing)"
+            echo "        create it with:  sandbox new $PROJECT"
+            exit 1
+        fi
+        echo "status: present"
+        load_project "$PROJECT"
+        echo "agent:  ${_AGENT:-$DEFAULT_AGENT}$([ -n "$_AGENT" ] || echo '  (default)')"
+        if [ -z "$(printf '%s' "$_IDENTITIES" | tr -d ' \t\n')" ]; then
+            echo "identities: none declared"
+        else
+            echo "identities (first = primary):"
+            while IFS="$_IFS_REC" read -r ghuser gname gemail ghost kc scopes; do
+                [ -n "$ghuser" ] || continue
+                if secret_get "$kc" >/dev/null 2>&1; then tok="ok"; else tok="MISSING — sandbox secret set $kc"; fi
+                printf '  %s@%s\n' "$ghuser" "$ghost"
+                printf '    git:   %s <%s>\n' "${gname:-—}" "${gemail:-—}"
+                printf '    token: %s  [keychain: %s]\n' "$kc" "$tok"
+                if [ -n "$(printf '%s' "$scopes" | tr -d ' ')" ]; then printf '    orgs: %s\n' "$scopes"; fi
+            done <<EOF
+$_IDENTITIES
+EOF
+        fi ;;
+    # Not a command — try the agent registry. Commands are matched first, so an
+    # agent can never shadow one; `agent run <name>` reaches it either way.
+    *) agent_exists "$CMD" || die "unknown command or agent '$CMD' (commands: shell, code, agent, config, audit, up, auth, keys, set-email, exec, status, stop, destroy; agents: $(agent_list | tr '\n' ' '))"
+       ensure_up; run_agent "$CMD" "$@" ;;
+esac
