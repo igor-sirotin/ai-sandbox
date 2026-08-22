@@ -21,6 +21,7 @@
 #   sandbox <project> auth           (re)apply GitHub identities/tokens from config
 #   sandbox <project> keys           ensure GPG signing key, add to GitHub, verify
 #   sandbox <project> set-email <email>  change the git email (regenerates GPG signing key)
+#   sandbox <project> rename <new>   rename the project: config, VM and Keychain items
 #   sandbox <project> config [--edit]    show (or edit) the project's config file
 #   sandbox <project> audit          report which GitHub credential the VM holds
 #   sandbox <project> exec CMD...    run a command in the VM
@@ -50,11 +51,15 @@ DEFAULT_AGENT="claude"
 
 # Commands are matched before the agent registry, so these names can never
 # resolve to an agent; `sandbox agents` warns if one is shadowed.
-BUILTIN_CMDS="up start auth keys set-email email shell code exec stop destroy delete status agent daemon daemons config conf audit"
+BUILTIN_CMDS="up start auth keys set-email email rename mv shell code exec stop destroy delete status agent daemon daemons config conf audit"
 
 die() { echo "sandbox: $*" >&2; exit 1; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
 is_builtin() { case " $BUILTIN_CMDS " in *" $1 "*) return 0 ;; esac; return 1; }
+# Matched before the project name in the top-level dispatch — a project named
+# after one of these could never be reached again.
+TOPLEVEL_CMDS="new ls list agents secret help"
+is_toplevel() { case " $TOPLEVEL_CMDS " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # --------------------------------------------------------------- validation
 # Values from the wizard, the CLI and *.conf all end up either in a file that is
@@ -728,6 +733,219 @@ new_project() {
     echo; echo ">> '$proj' ready.  Run:  sandbox $proj"
 }
 
+# ---------------------------------------------------------------- rename
+# Lima has no `rename`, so the instance is cloned under the new name and the old
+# one deleted. `limactl clone` reflinks the disk on APFS (instant, no second
+# copy) and never leaves a half-moved instance behind; the directory move is the
+# fallback for Lima versions that predate it.
+rename_vm() {
+    local from="$1" to="$2" clone_args=()
+    if limactl clone --help >/dev/null 2>&1; then
+        # Newer Lima drops into $EDITOR for the new instance unless told not to.
+        if limactl clone --help 2>&1 | grep -q -- '--tty'; then clone_args+=(--tty=false); fi
+        echo ">> renaming VM $from -> $to (clone + delete)..."
+        limactl clone ${clone_args[@]+"${clone_args[@]}"} "$from" "$to" \
+            || die "clone failed — '$from' is untouched"
+        limactl delete -f "$from" \
+            || echo "   !! '$to' is ready but '$from' could not be deleted — remove it with: limactl delete -f $from"
+    else
+        local lima_home="${LIMA_HOME:-$HOME/.lima}"
+        [ -d "$lima_home/$from" ] || die "no instance directory $lima_home/$from"
+        [ ! -e "$lima_home/$to" ] || die "$lima_home/$to already exists"
+        echo ">> renaming VM $from -> $to (moving $lima_home/$from)..."
+        mv "$lima_home/$from" "$lima_home/$to" || die "could not move the instance directory"
+        rm -f "$lima_home/$to/ssh.config"   # names the old host; Lima rewrites it on start
+    fi
+    echo "   (the guest's own hostname still says $from until the VM is re-created)"
+}
+
+# Copy a Keychain item to a new name. `security -i` reads its commands from
+# stdin, so the token stays out of argv — the same reason secret_put has
+# `security` prompt for it rather than passing it as an argument.
+kc_copy() {
+    local from="$1" to="$2" val
+    val="$(secret_get "$from")" || return 1
+    # The interactive parser splits on whitespace and strips quotes, so anything
+    # outside this set would arrive mangled: leave it where it is. A leading '-'
+    # is excluded too — it would be read as an option, leaving -w without a
+    # value, and `security` would then prompt on the tty with its output sent to
+    # /dev/null: an invisible hang.
+    [[ "$val" =~ ^[A-Za-z0-9_.+=/][A-Za-z0-9_.+=/-]*$ ]] || return 1
+    printf 'add-generic-password -U -s %s -a %s -w %s\n' \
+        "$(kc_service "$to")" "$USER" "$val" | security -i >/dev/null 2>&1 || return 1
+    [ "$(secret_get "$to" || true)" = "$val" ]
+}
+
+# The --token-keychain of every identity a config declares, one per line, or
+# non-zero if the file no longer parses. Sourcing it is how the launcher reads a
+# config everywhere else; this just asks what the result actually says.
+conf_kc_list() {
+    ( set -e
+      _IDENTITIES=""; _AGENT=""
+      # shellcheck source=/dev/null
+      source "$1" >/dev/null
+      printf '%s' "$_IDENTITIES" | while IFS="$_IFS_REC" read -r ghuser gname gemail ghost kc scopes; do
+          [ -n "$ghuser" ] || continue
+          printf '%s\n' "$kc"
+      done )
+}
+
+# Repoint one --token-keychain value in a config. Keychain names are validated
+# idents, so '.' is the only regex metacharacter that can occur.
+conf_rewrite_kc() {
+    local file="$1" okc="$2" nkc="$3" re tmp
+    re="${okc//./\\.}"
+    tmp="$(mktemp)"
+    sed -e "s/\(--token-keychain[[:space:]][[:space:]]*\)'$re'/\1'$nkc'/g" \
+        -e "s/\(--token-keychain[[:space:]][[:space:]]*\)\"$re\"/\1\"$nkc\"/g" \
+        -e "s/\(--token-keychain[[:space:]][[:space:]]*\)$re\([[:space:]]\)/\1$nkc\2/g" \
+        -e "s/\(--token-keychain[[:space:]][[:space:]]*\)$re\$/\1$nkc/g" \
+        "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    # Check what the rewritten file *declares*, not what it looks like: the
+    # patterns above cannot cover every hand-written form (a value continued
+    # onto the next line, say), and the old Keychain item is deleted right after
+    # this returns — a rewrite that quietly did nothing would strand the project
+    # on a token that no longer exists. Refusing here leaves both alone instead.
+    local decl
+    decl="$(conf_kc_list "$tmp")" || { rm -f "$tmp"; return 1; }   # must still parse
+    if printf '%s\n' "$decl" | grep -qxF -- "$okc"; then rm -f "$tmp"; return 1; fi
+    printf '%s\n' "$decl" | grep -qxF -- "$nkc" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }   # atomic, as set-email does
+    chmod 600 "$file"
+}
+
+# `sandbox new` names Keychain items "<project>-<ghuser>", so a rename leaves
+# them carrying the old project's name. Copy each under the new prefix, repoint
+# the config, then drop the old copy — in that order, so an interruption always
+# leaves the config pointing at a token that exists.
+rename_secrets() {
+    local old="$1" new="$2" conf="$3" real nkc other f k seen i=0 j=0
+    local -a from=() to=()
+    # conf_path dies inside the command substitution, which only kills the
+    # subshell: without this the Keychain step would be skipped silently and the
+    # rename would still report success.
+    if ! real="$(conf_path "$conf")"; then
+        echo "   !! could not read $conf — its Keychain items keep the '$old-' names"
+        return 1
+    fi
+    _IDENTITIES=""; _AGENT=""
+    # shellcheck source=/dev/null
+    source "$real"
+    while IFS="$_IFS_REC" read -r ghuser gname gemail ghost kc scopes; do
+        [ -n "$kc" ] || continue
+        case "$kc" in "$old-"*) ;; *) continue ;; esac
+        nkc="$new-${kc#"$old-"}"
+        valid_ident "$nkc" || continue
+        secret_get "$kc" >/dev/null 2>&1 || continue      # nothing stored under it
+        if secret_get "$nkc" >/dev/null 2>&1; then
+            echo "   !! $(kc_service "$nkc") already exists — keeping $kc"
+            continue
+        fi
+        # A token shared with another project has to keep its name there.
+        other=0
+        for f in "$PROJECTS"/*.conf; do
+            [ -f "$f" ] || continue
+            [ "$f" = "$PROJECTS/$new.conf" ] && continue
+            if grep -qE -- "--token-keychain[[:space:]]+['\"]?${kc//./\\.}['\"]?([[:space:]]|\$)" "$f" 2>/dev/null; then
+                other=1; break
+            fi
+        done
+        if [ "$other" = 1 ]; then
+            echo "   !! $kc is also referenced by $f — keeping its name"
+            continue
+        fi
+        seen=0
+        for k in ${from[@]+"${from[@]}"}; do
+            if [ "$k" = "$kc" ]; then seen=1; break; fi   # shared by two identities
+        done
+        [ "$seen" = 0 ] || continue
+        from+=("$kc"); to+=("$nkc")
+    done <<EOF
+$_IDENTITIES
+EOF
+    [ "${#from[@]}" -gt 0 ] || return 0
+
+    echo ">> Keychain items still named after '$old':"
+    while [ "$i" -lt "${#from[@]}" ]; do printf '     %s -> %s\n' "${from[$i]}" "${to[$i]}"; i=$((i+1)); done
+    confirm "Rename them too (the config is repointed for you)?" "Y" || {
+        echo "   left alone — '$new' keeps using the '$old-' Keychain names"
+        return 0
+    }
+    # Copy every one before touching anything: a partial migration would leave
+    # some identities pointing at names that were never created.
+    i=0
+    while [ "$i" -lt "${#from[@]}" ]; do
+        if ! kc_copy "${from[$i]}" "${to[$i]}"; then
+            echo "   !! could not copy ${from[$i]} -> ${to[$i]} — leaving every Keychain item as it is"
+            # -le, not -lt: kc_copy may have created to[i] and failed only
+            # at the verification that follows it.
+            while [ "$j" -le "$i" ]; do secret_rm "${to[$j]}" >/dev/null 2>&1 || true; j=$((j+1)); done
+            return 0
+        fi
+        i=$((i+1))
+    done
+    i=0
+    while [ "$i" -lt "${#from[@]}" ]; do
+        if conf_rewrite_kc "$real" "${from[$i]}" "${to[$i]}"; then
+            secret_rm "${from[$i]}" >/dev/null 2>&1 \
+                || echo "   !! kept the old item — remove it with: sandbox secret rm ${from[$i]}"
+            echo "   $(kc_service "${from[$i]}") -> $(kc_service "${to[$i]}")"
+        else
+            echo "   !! could not repoint $real at ${to[$i]} — edit its --token-keychain by hand"
+            secret_rm "${to[$i]}" >/dev/null 2>&1 || true
+        fi
+        i=$((i+1))
+    done
+}
+
+rename_project() { # $1 = the new name for $PROJECT
+    local old="$PROJECT" new="${1:-}"
+    [ $# -le 1 ] || die "usage: sandbox $old rename <new-name>"
+    [ -n "$new" ] || die "usage: sandbox $old rename <new-name>"
+    valid_ident "$new" || die "invalid project name '$new' — use letters, digits, '.', '_', '-'"
+    ! is_toplevel "$new" || die "'$new' is a sandbox command — 'sandbox $new ...' would never reach the project"
+    [ "$new" != "$old" ] || die "'$old' is already called that"
+    local oconf="$PROJECTS/$old.conf" nconf="$PROJECTS/$new.conf" ninst="${PREFIX}$new"
+    if [ -e "$nconf" ] || [ -L "$nconf" ]; then   # -L too: -e is false for a dangling link
+        die "$nconf already exists — pick another name"
+    fi
+    ! limactl list -q 2>/dev/null | grep -qx "$ninst" || die "a VM named '$ninst' already exists — pick another name"
+
+    # The VM goes first: it is the step that can fail, and a config renamed
+    # ahead of it would be left describing a project with no VM.
+    if exists; then
+        if running; then
+            echo "!! '$INST' is running — it has to be stopped to be renamed."
+            confirm "Stop it now?" "Y" || die "aborted — nothing was changed"
+            limactl stop "$INST"
+        fi
+        rename_vm "$INST" "$ninst"
+    else
+        echo ">> no VM '$INST' — renaming the config only"
+    fi
+
+    if [ -f "$oconf" ]; then
+        # `mv` moves a symlink itself, so a config linked out of a dotfiles
+        # checkout keeps pointing at the same file under its new name.
+        mv "$oconf" "$nconf" \
+            || die "the VM is now '$ninst' but $oconf could not be renamed — move it to $nconf by hand"
+        echo ">> config: $oconf -> $nconf"
+        rename_secrets "$old" "$new" "$nconf" || true
+    else
+        echo ">> no config $oconf — nothing else to rename"
+    fi
+
+    PROJECT="$new"; INST="$ninst"      # so anything below sees the renamed project
+    # A daemon's unit carries SANDBOX_PROJECT (the remote-control session is
+    # named after it), and the VM is stopped here, so the next start rewrites it
+    # under the new name on its own — but say so, since until then the session
+    # on claude.ai still shows the old one.
+    if [ -n "$(project_daemons 2>/dev/null || true)" ]; then
+        echo ">> its daemons still announce 'sandbox-$old' — the next start re-installs them as 'sandbox-$new'"
+    fi
+    echo ">> '$old' is now '$new'.  Run:  sandbox $new"
+}
+
 # ------------------------------------------------------------------- dispatch
 case "${1:-}" in
     ""|-h|--help|help) usage; exit 0 ;;
@@ -806,6 +1024,8 @@ case "$CMD" in
         ensure_up
         setup_keys   # regenerates the GPG signing key for the new email + re-points signing
         ;;
+    rename|mv)
+        rename_project "$@" ;;
     shell)    ensure_up; exec limactl shell "$INST" ;;
     code)     ensure_up
               command -v code >/dev/null 2>&1 || die "VS Code 'code' CLI not on PATH (install it / enable 'code' command)"
@@ -979,6 +1199,6 @@ EOF
         fi ;;
     # Not a command — try the agent registry. Commands are matched first, so an
     # agent can never shadow one; `agent run <name>` reaches it either way.
-    *) agent_exists "$CMD" || die "unknown command or agent '$CMD' (commands: shell, code, agent, config, audit, up, auth, keys, set-email, exec, status, stop, destroy; agents: $(agent_list | tr '\n' ' '))"
+    *) agent_exists "$CMD" || die "unknown command or agent '$CMD' (commands: shell, code, agent, config, audit, up, auth, keys, set-email, rename, exec, status, stop, destroy; agents: $(agent_list | tr '\n' ' '))"
        ensure_up; run_agent "$CMD" "$@" ;;
 esac

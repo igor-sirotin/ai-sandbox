@@ -45,6 +45,7 @@ sandbox <project> up           # create/start the VM (auto-applies identities)
 sandbox <project> auth         # re-apply identities/tokens (after edits/rotation)
 sandbox <project> keys         # (re)create GPG signing key, add to GitHub, verify
 sandbox <project> set-email <email>  # change the git email (regenerates the GPG key)
+sandbox <project> rename <new>       # rename the project (config, VM, Keychain items)
 sandbox <project> config [--edit]    # show (or edit) the project's config file
 sandbox <project> audit              # report which GitHub credential the VM holds
 sandbox <project> exec 'go test ./...'
@@ -58,6 +59,31 @@ projects (one with a config, or an existing VM) are accepted — an unrecognised
 name is an error listing the known projects, so a typo can't silently provision
 a whole new VM. Use `sandbox new <project>` to create one.
 (`sandbox` = `~/ai-sandbox/sandbox`, symlinked into `~/.local/bin`.)
+
+### Renaming a project
+
+```sh
+sandbox acme rename widgets
+```
+
+Renames all three things a project's name is attached to: `projects/acme.conf`
+becomes `projects/widgets.conf`, the VM `claude-acme` becomes `claude-widgets`,
+and the Keychain items `acme-<user>` become `widgets-<user>` (asked for
+separately, and the config's `--token-keychain` values are repointed for you).
+A token that another project's config also references keeps its name.
+
+The VM has to be stopped — you're offered to stop it. Lima has no rename, so the
+instance is cloned under the new name and the old one deleted; on APFS the clone
+reflinks the disk, so nothing is copied twice. Nothing inside the VM changes:
+the workspace, tokens and GPG signing key are the same ones, and no `auth` or
+`keys` re-run is needed. The guest's own hostname keeps saying `lima-claude-acme`
+until the VM is re-created — cosmetic.
+
+Background daemons name their session after the project (`sandbox-acme` on
+claude.ai), so the next start re-installs them as `sandbox-widgets`; the rename
+says so when the project runs any.
+
+A config symlinked out of a dotfiles checkout stays a symlink, renamed in place.
 
 ## Agents
 
