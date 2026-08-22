@@ -21,6 +21,11 @@ add_identity \
 # See available agents with `sandbox agents`, or: sandbox <project> agent default <name>
 use_agent claude
 
+# Background daemons kept running in the VM with nobody attached — Claude Code's
+# Remote Control, so the sandbox is drivable from claude.ai/code and the phone.
+# Omit for "the agent above, if it declares one"; `use_daemon none` disables.
+# use_daemon claude
+
 # Optional: a second account whose token is used only for repos under one org.
 # Routing is by longest "<host>/<org>" match; everything else uses the primary.
 # add_identity \
@@ -37,3 +42,5 @@ use_agent claude
 #   --github-host      GitHub host (default: github.com)
 #
 # use_agent <name>     agent for a bare `sandbox <project>` (default: claude)
+# use_daemon <name>    agent whose background daemon the VM keeps running
+#                      (repeatable; default: the use_agent one; 'none' = off)
