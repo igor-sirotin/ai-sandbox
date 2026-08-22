@@ -56,6 +56,10 @@ BUILTIN_CMDS="up start auth keys set-email email rename mv shell code exec stop 
 die() { echo "sandbox: $*" >&2; exit 1; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
 is_builtin() { case " $BUILTIN_CMDS " in *" $1 "*) return 0 ;; esac; return 1; }
+# Matched before the project name in the top-level dispatch — a project named
+# after one of these could never be reached again.
+TOPLEVEL_CMDS="new ls list agents secret help"
+is_toplevel() { case " $TOPLEVEL_CMDS " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # --------------------------------------------------------------- validation
 # Values from the wizard, the CLI and *.conf all end up either in a file that is
@@ -762,11 +766,28 @@ kc_copy() {
     local from="$1" to="$2" val
     val="$(secret_get "$from")" || return 1
     # The interactive parser splits on whitespace and strips quotes, so anything
-    # outside this set would arrive mangled: leave it where it is.
-    [[ "$val" =~ ^[A-Za-z0-9_.+=/-]+$ ]] || return 1
+    # outside this set would arrive mangled: leave it where it is. A leading '-'
+    # is excluded too — it would be read as an option, leaving -w without a
+    # value, and `security` would then prompt on the tty with its output sent to
+    # /dev/null: an invisible hang.
+    [[ "$val" =~ ^[A-Za-z0-9_.+=/][A-Za-z0-9_.+=/-]*$ ]] || return 1
     printf 'add-generic-password -U -s %s -a %s -w %s\n' \
         "$(kc_service "$to")" "$USER" "$val" | security -i >/dev/null 2>&1 || return 1
     [ "$(secret_get "$to" || true)" = "$val" ]
+}
+
+# The --token-keychain of every identity a config declares, one per line, or
+# non-zero if the file no longer parses. Sourcing it is how the launcher reads a
+# config everywhere else; this just asks what the result actually says.
+conf_kc_list() {
+    ( set -e
+      _IDENTITIES=""; _AGENT=""
+      # shellcheck source=/dev/null
+      source "$1" >/dev/null
+      printf '%s' "$_IDENTITIES" | while IFS="$_IFS_REC" read -r ghuser gname gemail ghost kc scopes; do
+          [ -n "$ghuser" ] || continue
+          printf '%s\n' "$kc"
+      done )
 }
 
 # Repoint one --token-keychain value in a config. Keychain names are validated
@@ -776,10 +797,19 @@ conf_rewrite_kc() {
     re="${okc//./\\.}"
     tmp="$(mktemp)"
     sed -e "s/\(--token-keychain[[:space:]][[:space:]]*\)'$re'/\1'$nkc'/g" \
+        -e "s/\(--token-keychain[[:space:]][[:space:]]*\)\"$re\"/\1\"$nkc\"/g" \
         -e "s/\(--token-keychain[[:space:]][[:space:]]*\)$re\([[:space:]]\)/\1$nkc\2/g" \
         -e "s/\(--token-keychain[[:space:]][[:space:]]*\)$re\$/\1$nkc/g" \
         "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
-    grep -qF -- "$nkc" "$tmp" || { rm -f "$tmp"; return 1; }
+    # Check what the rewritten file *declares*, not what it looks like: the
+    # patterns above cannot cover every hand-written form (a value continued
+    # onto the next line, say), and the old Keychain item is deleted right after
+    # this returns — a rewrite that quietly did nothing would strand the project
+    # on a token that no longer exists. Refusing here leaves both alone instead.
+    local decl
+    decl="$(conf_kc_list "$tmp")" || { rm -f "$tmp"; return 1; }   # must still parse
+    if printf '%s\n' "$decl" | grep -qxF -- "$okc"; then rm -f "$tmp"; return 1; fi
+    printf '%s\n' "$decl" | grep -qxF -- "$nkc" || { rm -f "$tmp"; return 1; }
     mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }   # atomic, as set-email does
     chmod 600 "$file"
 }
@@ -789,9 +819,15 @@ conf_rewrite_kc() {
 # the config, then drop the old copy — in that order, so an interruption always
 # leaves the config pointing at a token that exists.
 rename_secrets() {
-    local old="$1" new="$2" conf="$3" real nkc other f i=0 j=0
+    local old="$1" new="$2" conf="$3" real nkc other f k seen i=0 j=0
     local -a from=() to=()
-    real="$(conf_path "$conf")" || return 0
+    # conf_path dies inside the command substitution, which only kills the
+    # subshell: without this the Keychain step would be skipped silently and the
+    # rename would still report success.
+    if ! real="$(conf_path "$conf")"; then
+        echo "   !! could not read $conf — its Keychain items keep the '$old-' names"
+        return 1
+    fi
     _IDENTITIES=""; _AGENT=""
     # shellcheck source=/dev/null
     source "$real"
@@ -810,12 +846,19 @@ rename_secrets() {
         for f in "$PROJECTS"/*.conf; do
             [ -f "$f" ] || continue
             [ "$f" = "$PROJECTS/$new.conf" ] && continue
-            if grep -qF -- "$kc" "$f" 2>/dev/null; then other=1; break; fi
+            if grep -qE -- "--token-keychain[[:space:]]+['\"]?${kc//./\\.}['\"]?([[:space:]]|\$)" "$f" 2>/dev/null; then
+                other=1; break
+            fi
         done
         if [ "$other" = 1 ]; then
             echo "   !! $kc is also referenced by $f — keeping its name"
             continue
         fi
+        seen=0
+        for k in ${from[@]+"${from[@]}"}; do
+            if [ "$k" = "$kc" ]; then seen=1; break; fi   # shared by two identities
+        done
+        [ "$seen" = 0 ] || continue
         from+=("$kc"); to+=("$nkc")
     done <<EOF
 $_IDENTITIES
@@ -834,7 +877,9 @@ EOF
     while [ "$i" -lt "${#from[@]}" ]; do
         if ! kc_copy "${from[$i]}" "${to[$i]}"; then
             echo "   !! could not copy ${from[$i]} -> ${to[$i]} — leaving every Keychain item as it is"
-            while [ "$j" -lt "$i" ]; do secret_rm "${to[$j]}" >/dev/null 2>&1 || true; j=$((j+1)); done
+            # -le, not -lt: kc_copy may have created to[i] and failed only
+            # at the verification that follows it.
+            while [ "$j" -le "$i" ]; do secret_rm "${to[$j]}" >/dev/null 2>&1 || true; j=$((j+1)); done
             return 0
         fi
         i=$((i+1))
@@ -858,9 +903,12 @@ rename_project() { # $1 = the new name for $PROJECT
     [ $# -le 1 ] || die "usage: sandbox $old rename <new-name>"
     [ -n "$new" ] || die "usage: sandbox $old rename <new-name>"
     valid_ident "$new" || die "invalid project name '$new' — use letters, digits, '.', '_', '-'"
+    ! is_toplevel "$new" || die "'$new' is a sandbox command — 'sandbox $new ...' would never reach the project"
     [ "$new" != "$old" ] || die "'$old' is already called that"
     local oconf="$PROJECTS/$old.conf" nconf="$PROJECTS/$new.conf" ninst="${PREFIX}$new"
-    [ ! -e "$nconf" ] || die "$nconf already exists — pick another name"
+    if [ -e "$nconf" ] || [ -L "$nconf" ]; then   # -L too: -e is false for a dangling link
+        die "$nconf already exists — pick another name"
+    fi
     ! limactl list -q 2>/dev/null | grep -qx "$ninst" || die "a VM named '$ninst' already exists — pick another name"
 
     # The VM goes first: it is the step that can fail, and a config renamed
@@ -882,7 +930,7 @@ rename_project() { # $1 = the new name for $PROJECT
         mv "$oconf" "$nconf" \
             || die "the VM is now '$ninst' but $oconf could not be renamed — move it to $nconf by hand"
         echo ">> config: $oconf -> $nconf"
-        rename_secrets "$old" "$new" "$nconf"
+        rename_secrets "$old" "$new" "$nconf" || true
     else
         echo ">> no config $oconf — nothing else to rename"
     fi
