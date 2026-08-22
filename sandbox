@@ -13,6 +13,8 @@
 #   sandbox <project> agent default <name>        set the project's default agent
 #   sandbox <project> agent run <name> [args...]  run an agent (works even if its
 #                                                 name collides with a command)
+#   sandbox <project> daemon         background daemons (e.g. `claude remote-control`):
+#                                    ls | status | logs [-f] | start | stop | restart | install | off
 #   sandbox <project> shell          interactive shell in the VM
 #   sandbox <project> code [path]    open VS Code (Remote-SSH) in the VM
 #   sandbox <project> up             create/start the VM (auto-applies identities)
@@ -48,7 +50,7 @@ DEFAULT_AGENT="claude"
 
 # Commands are matched before the agent registry, so these names can never
 # resolve to an agent; `sandbox agents` warns if one is shadowed.
-BUILTIN_CMDS="up start auth keys set-email email shell code exec stop destroy delete status agent config conf audit"
+BUILTIN_CMDS="up start auth keys set-email email shell code exec stop destroy delete status agent daemon daemons config conf audit"
 
 die() { echo "sandbox: $*" >&2; exit 1; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
@@ -137,6 +139,12 @@ add_identity() {
 _AGENT=""
 use_agent() { _AGENT="$1"; }
 
+# ...and `use_daemon <agent>` (repeatable) to pick which agents' background
+# daemons the VM keeps running with nobody attached. Absent => the project's
+# own agent, if it declares one; `use_daemon none` turns them off.
+_DAEMONS=""
+use_daemon() { _DAEMONS="$_DAEMONS $1"; }
+
 # Resolve a path to the file it finally points at. The checks below must apply
 # to what actually gets sourced, not to a symlink standing in front of it:
 # `find` does not follow links (-P is the default) and a macOS symlink is 0755,
@@ -179,7 +187,7 @@ conf_path() {
     printf '%s' "$real"
 }
 load_project() {
-    _IDENTITIES=""; _AGENT=""
+    _IDENTITIES=""; _AGENT=""; _DAEMONS=""
     local f="$PROJECTS/$1.conf" real
     [ -f "$f" ] || return 0
     real="$(conf_path "$f")" || exit 1
@@ -193,13 +201,14 @@ project_agent() { load_project "$1"; printf '%s' "${_AGENT:-$DEFAULT_AGENT}"; }
 # agents/<name>.conf declares how to install and launch one coding agent.
 # Values are run inside the VM, so '$HOME' must stay single-quoted in the conf —
 # it is expanded by the VM's shell, not here.
-_A_DESC=""; _A_BIN=""; _A_PATHS=""; _A_INSTALL=""; _A_SETUP=""; _A_LAUNCH=""
+_A_DESC=""; _A_BIN=""; _A_PATHS=""; _A_INSTALL=""; _A_SETUP=""; _A_LAUNCH=""; _A_DAEMON=""
 agent_desc()    { _A_DESC="$1"; }
 agent_bin()     { _A_BIN="$1"; }
 agent_path()    { _A_PATHS="$_A_PATHS $1"; }
 agent_install() { _A_INSTALL="$1"; }
 agent_setup()   { _A_SETUP="$1"; }
 agent_launch()  { _A_LAUNCH="$1"; }
+agent_daemon()  { _A_DAEMON="$1"; }
 
 # Classify a GitHub credential by its prefix. Only fine-grained PATs are bound
 # to one owner with explicit per-repo permissions; the rest are account-wide.
@@ -226,7 +235,7 @@ project_list() {
 agent_exists() { [ -n "${1:-}" ] && [ -f "$AGENTS/$1.conf" ]; }
 agent_list()   { ls "$AGENTS"/*.conf 2>/dev/null | sed 's|.*/||; s|\.conf$||' || true; }
 load_agent() {
-    _A_DESC=""; _A_BIN=""; _A_PATHS=""; _A_INSTALL=""; _A_SETUP=""; _A_LAUNCH=""
+    _A_DESC=""; _A_BIN=""; _A_PATHS=""; _A_INSTALL=""; _A_SETUP=""; _A_LAUNCH=""; _A_DAEMON=""
     agent_exists "$1" || die "unknown agent '$1' (see: sandbox agents)"
     source "$AGENTS/$1.conf"
     [ -n "$_A_BIN" ]    || die "agents/$1.conf: agent_bin is required"
@@ -273,19 +282,195 @@ run_agent() { # $1=agent, rest = args passed through to it
         bash -lc "$(agent_prelude)cd ~/workspace 2>/dev/null || cd ~; $_A_LAUNCH" _ "$@"
 }
 
+# ----------------------------------------------------------- background daemons
+# An agent may declare `agent_daemon '<command>'`: a long-running server that
+# should be up whenever the VM is, with no terminal attached. The motivating
+# case is `claude remote-control` — drive the sandbox from claude.ai/code or the
+# phone without keeping a `sandbox <project>` terminal open. It is installed as
+# a systemd *user* unit with lingering enabled, so it starts with the VM and
+# survives you disconnecting from it.
+#
+# Which daemons a project runs comes from `use_daemon <agent>` in its config
+# (repeatable); unset means "this project's own agent, if it declares one", and
+# `use_daemon none` turns them off.
+daemon_unit()   { printf 'sandbox-%s.service' "$1"; }
+daemon_script() { printf '.config/sandbox/daemon-%s.sh' "$1"; }
+sha256()        { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | cut -d' ' -f1; }
+
+agents_with_daemon() {
+    local a
+    for a in $(agent_list); do
+        load_agent "$a"
+        if [ -n "$_A_DAEMON" ]; then printf '%s\n' "$a"; fi
+    done
+}
+
+project_daemons() {   # echo the agents whose daemon this project wants
+    load_project "$PROJECT"
+    local a out="" want=()
+    read -ra want <<<"${_DAEMONS:-${_AGENT:-$DEFAULT_AGENT}}"   # split, don't glob
+    for a in ${want[@]+"${want[@]}"}; do
+        [ "$a" != none ] || return 0
+        agent_exists "$a" || die "use_daemon: unknown agent '$a' (see: sandbox agents)"
+        load_agent "$a"
+        if [ -n "$_A_DAEMON" ]; then out="$out $a"; fi
+    done
+    printf '%s' "${out# }"
+}
+
+# The wrapper the unit runs, as a file in the VM rather than an inline
+# ExecStart=: systemd's quoting rules are not the shell's, and this way the
+# exact command is inspectable — and runnable by hand — inside the VM. `-l` so
+# it gets the same login environment an interactive agent would (toolchain PATH,
+# the pinned GH_TOKEN, IS_SANDBOX).
+daemon_script_body() {   # $1 = agent name (already loaded)
+    cat <<EOF
+#!/bin/bash -l
+# Generated by the sandbox launcher for project '$PROJECT' — overwritten on the
+# next 'sandbox $PROJECT up'. Run by systemd as $(daemon_unit "$1").
+set -u
+$(agent_prelude)
+cd "\$HOME/workspace" 2>/dev/null || cd "\$HOME"
+$_A_DAEMON
+EOF
+}
+
+daemon_unit_body() {   # $1 = agent name (already loaded), $2 = content hash
+    cat <<EOF
+[Unit]
+Description=sandbox daemon: $1 ($PROJECT)
+After=network-online.target
+Wants=network-online.target
+# Give up after ~10 failures in 10 minutes instead of crash-looping forever (an
+# agent that was never logged in fails every time); 'daemon restart' un-wedges.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+# sandbox-config: $2
+
+[Service]
+Type=simple
+ExecStart=%h/$(daemon_script "$1")
+Restart=always
+RestartSec=15
+Environment=SANDBOX_PROJECT=$PROJECT
+Environment=TERM=xterm-256color
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+# Idempotent: rewrites the wrapper and the unit, but only restarts a daemon that
+# is already up if what it runs actually changed — the hash in the unit covers
+# both files, so `up` on a live VM never drops a connected remote session.
+install_daemon() {   # $1 = agent name; assumes the VM is up
+    local name="$1" hash
+    ensure_agent "$name"          # installs it on first use; also load_agent's it
+    [ -n "$_A_DAEMON" ] || die "agent '$name' declares no agent_daemon"
+    hash="$( { daemon_script_body "$name"; daemon_unit_body "$name" ""; } | sha256 )"
+
+    daemon_script_body "$name" | vm env S="$(daemon_script "$name")" bash -lc '
+        set -e; umask 077
+        mkdir -p "$(dirname "$HOME/$S")"
+        cat > "$HOME/$S.new"
+        chmod 0755 "$HOME/$S.new"
+        mv "$HOME/$S.new" "$HOME/$S"' || die "could not install the daemon wrapper for '$name'"
+
+    daemon_unit_body "$name" "$hash" | vm env U="$(daemon_unit "$name")" bash -lc '
+        set -e
+        # Lingering, or the user manager — and the daemon with it — is torn down
+        # when the last session ends, and only returns at the next login.
+        sudo loginctl enable-linger "$USER" >/dev/null
+        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        mkdir -p ~/.config/systemd/user
+        f=~/.config/systemd/user/"$U"
+        cat > "$f.new"
+        changed=1; if cmp -s "$f.new" "$f" 2>/dev/null; then changed=0; fi
+        mv "$f.new" "$f"
+        systemctl --user daemon-reload
+        systemctl --user enable "$U" >/dev/null 2>&1
+        if [ "$changed" = 1 ]; then systemctl --user restart "$U"; else systemctl --user start "$U"; fi' \
+        || die "systemd refused the '$name' daemon (see: sandbox $PROJECT daemon status $name)"
+}
+
+daemon_one_line() { printf '%s' "$1" | tr '\n' ' ' | sed 's/\\ */ /g; s/  */ /g'; }
+
+daemon_state() {   # $1 = agent -> "<enabled>/<active>", or why not
+    vm env U="$(daemon_unit "$1")" bash -lc '
+        [ -f ~/.config/systemd/user/"$U" ] || { echo "not installed"; exit 0; }
+        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        printf "%s/%s\n" "$(systemctl --user is-enabled "$U" 2>&1)" \
+                         "$(systemctl --user is-active  "$U" 2>&1)"' </dev/null 2>/dev/null \
+        || echo unknown
+}
+
+daemon_ctl() {   # $1 = agent, rest = systemctl verbs
+    local name="$1"; shift
+    vm env U="$(daemon_unit "$name")" bash -lc '
+        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        exec systemctl --user "$@" "$U"' _ "$@" </dev/null
+}
+
+# A daemon captures its environment when it starts — including the pinned
+# GH_TOKEN — so a rotated token only reaches it across a restart. Only bounces
+# what is actually running.
+refresh_daemons() {
+    local d ds
+    ds="$(project_daemons)" || return 0
+    for d in ${ds:-}; do
+        if daemon_ctl "$d" is-active >/dev/null 2>&1; then
+            daemon_ctl "$d" restart >/dev/null 2>&1 || true
+            echo ">> daemon '$d' restarted so it picks up the new credentials"
+        fi
+    done
+    return 0
+}
+
+# Run when the launcher brings the VM up. Non-fatal by construction: a daemon
+# that will not start must never stand between you and a shell — hence the
+# subshell, since install_daemon can die().
+ensure_daemons() {
+    local d ds
+    ds="$(project_daemons)" || return 0
+    [ -n "$ds" ] || return 0
+    local st
+    for d in $ds; do
+        if ( install_daemon "$d" ); then
+            st="$(daemon_state "$d")"
+            echo ">> daemon '$d': $st   (logs: sandbox $PROJECT daemon logs $d)"
+            case "$st" in
+                */active) ;;
+                *) echo "   not up — usually means the agent was never logged in here:"
+                   echo "   run 'sandbox $PROJECT $d', /login, then 'sandbox $PROJECT daemon restart'" ;;
+            esac
+        else
+            echo "   !! daemon '$d' did not start — see: sandbox $PROJECT daemon status $d"
+        fi
+    done
+    return 0
+}
+
 # --------------------------------------------------------------- VM lifecycle
 exists()  { limactl list -q 2>/dev/null | grep -qx "$INST"; }
 running() { [ "$(limactl list "$INST" --format '{{.Status}}' 2>/dev/null)" = "Running" ]; }
 vm()      { limactl shell "$INST" "$@"; }   # run a program in the VM
 
+_VM_COLD=0     # did *this* invocation start the VM?
 ensure_up() {
+    _VM_COLD=0
     if ! exists; then
         echo ">> creating VM '$INST' (first run provisions toolchains — a few minutes)..."
         limactl start --name "$INST" --tty=false "$TEMPLATE"
         configure_identities   # auto-apply project auth on first create
+        _VM_COLD=1
     elif ! running; then
         limactl start "$INST"
+        _VM_COLD=1
     fi
+    # Background daemons are *enabled* systemd units, so once installed they
+    # come up with the VM on their own — no need to poke them on every command.
+    # Installing them here is what makes them appear on a VM that predates them.
+    if [ "$_VM_COLD" = 1 ]; then ensure_daemons; fi
 }
 
 configure_identities() { # assumes VM is up
@@ -517,6 +702,21 @@ new_project() {
     done
     { echo; echo "# agent opened by a bare 'sandbox $proj'"; echo "use_agent $agent"; } >> "$conf"
 
+    # Background daemon — on by default when the agent declares one: the point
+    # of it is to outlive the terminal you started the VM from.
+    load_agent "$agent"
+    if [ -n "$_A_DAEMON" ]; then
+        echo
+        echo "Remote control: keep '$agent' running inside the VM with nothing attached,"
+        echo "so you can drive '$proj' from claude.ai/code or the Claude app. It can reach"
+        echo "everything in the VM, including this project's tokens and signing key."
+        if confirm "Enable it?" "Y"; then
+            { echo; echo "# daemon kept running whenever the VM is up"; echo "use_daemon $agent"; } >> "$conf"
+        else
+            { echo; echo "# no background daemon for this project"; echo "use_daemon none"; } >> "$conf"
+        fi
+    fi
+
     echo; echo "Wrote $conf"
     PROJECT="$proj"; INST="${PREFIX}${proj}"
     confirm "Create and provision the VM now (~5-10 min)?" "Y" || { echo "Later: sandbox $proj up"; return 0; }
@@ -576,8 +776,10 @@ case "$CMD" in
 esac
 
 case "$CMD" in
-    up|start) ensure_up; echo ">> $INST running." ;;
-    auth)     ensure_up; configure_identities ;;
+    up|start) ensure_up
+              if [ "$_VM_COLD" = 0 ]; then ensure_daemons; fi   # already running: reconcile
+              echo ">> $INST running." ;;
+    auth)     ensure_up; configure_identities; refresh_daemons ;;
     keys)     ensure_up; setup_keys ;;
     set-email|email)
         new_email="${1:-}"
@@ -644,6 +846,44 @@ case "$CMD" in
                 ensure_up; run_agent "$agent_run_name" "$@" ;;
             *) die "usage: sandbox $PROJECT agent [ls|install <name>|default <name>|run <name> ...]" ;;
         esac ;;
+    daemon|daemons)
+        sub="${1:-ls}"; if [ $# -gt 0 ]; then shift; fi
+        case "$sub" in
+            ls|list|status|logs|start|stop|restart|install|off) ;;
+            *) die "usage: sandbox $PROJECT daemon [ls|status|logs [-f]|start|stop|restart|install|off] [agent]" ;;
+        esac
+        dfollow=""; dnames=""
+        for a in ${@+"$@"}; do
+            case "$a" in
+                -f|--follow) dfollow="-f" ;;
+                -*) die "sandbox $PROJECT daemon $sub: unknown option '$a'" ;;
+                *)  agent_exists "$a" || die "unknown agent '$a' (see: sandbox agents)"
+                    dnames="$dnames $a" ;;
+            esac
+        done
+        dnames="${dnames# }"
+        [ -n "$dnames" ] || dnames="$(project_daemons)"
+        [ -n "$dnames" ] || die "'$PROJECT' runs no background daemon (its agent declares none, or the config says 'use_daemon none')
+  agents that declare one: $(agents_with_daemon | tr '\n' ' ')
+  turn one on with:  sandbox $PROJECT config --edit   # add: use_daemon <agent>"
+        ensure_up
+        case "$sub" in ls|list) echo "background daemons for '$PROJECT' in $INST:" ;; esac
+        for d in $dnames; do
+            case "$sub" in
+                ls|list)  load_agent "$d"
+                          printf '  %-10s %-18s %s\n' "$d" "$(daemon_state "$d")" "$(daemon_one_line "$_A_DAEMON")" ;;
+                install)  install_daemon "$d"; echo ">> daemon '$d': $(daemon_state "$d")" ;;
+                status)   daemon_ctl "$d" status --no-pager || true ;;
+                start|stop|restart)
+                          daemon_ctl "$d" "$sub"; echo ">> daemon '$d': $(daemon_state "$d")" ;;
+                off)      daemon_ctl "$d" disable --now || true
+                          echo ">> daemon '$d' stopped and disabled — it will not return with the VM
+   (put 'use_daemon none' in the config to keep 'up' from switching it back on)" ;;
+                logs)     exec limactl shell "$INST" env U="$(daemon_unit "$d")" F="$dfollow" bash -lc '
+                              export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+                              exec journalctl --user -u "$U" -n 200 --no-pager ${F:+$F}' ;;
+            esac
+        done ;;
     exec)     ensure_up; [ $# -gt 0 ] || die "exec needs a command"
               if [ $# -eq 1 ]; then
                   exec limactl shell "$INST" bash -lc "$1"                  # documented: exec 'go test ./...'

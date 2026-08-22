@@ -36,6 +36,9 @@ sandbox <project> agent        # list agents + whether they're installed in this
 sandbox <project> agent install <name>   # install an agent into the VM
 sandbox <project> agent default <name>   # set the project's default agent
 sandbox <project> agent run <name> [args...]  # run an agent explicitly
+sandbox <project> daemon       # background daemons (Claude Remote Control): state of each
+sandbox <project> daemon logs [-f]        # journal of a background daemon
+sandbox <project> daemon restart|off      # restart, or stop and disable one
 sandbox <project> shell        # interactive shell in the VM
 sandbox <project> code [path]  # open VS Code (Remote-SSH) in the VM
 sandbox <project> up           # create/start the VM (auto-applies identities)
@@ -71,7 +74,9 @@ agent_launch  'exec opencode "$@"'
 ```
 
 **Adding an agent is a new file — nothing else changes.** Values run *inside* the
-VM, so keep `$HOME` single-quoted; it's expanded by the VM's shell.
+VM, so keep `$HOME` single-quoted; it's expanded by the VM's shell. An agent may
+also declare `agent_daemon '<command>'` — a server the VM keeps running with
+nobody attached (see [Background daemons](#background-daemons--remote-control)).
 
 Agents are installed **into the VM on first use**, not by the Lima template. That
 means VMs you created months ago pick up newly added agents too — a template edit
@@ -105,6 +110,41 @@ per-VM, so projects don't share agent credentials any more than they share token
 
 > Browser-based sign-in in a headless VM prints a URL — open it on the host and
 > paste the code back. API-key auth avoids the round trip.
+
+### Background daemons — remote control
+
+`agents/claude.conf` declares an `agent_daemon`: **Claude Code Remote Control**.
+It comes up with the VM, so every sandbox is drivable from claude.ai/code and the
+Claude app — under the name `sandbox-<project>` — with no terminal attached to it:
+
+```sh
+sandbox acme up                 # the daemon starts with the VM
+sandbox acme daemon             # claude   enabled/active   exec claude remote-control ...
+sandbox acme daemon logs -f
+```
+
+It runs as a **systemd user unit** (`sandbox-claude.service`) with
+`loginctl enable-linger` on: it starts at VM boot, survives closing the terminal
+you launched from, and restarts if it dies. `ExecStart` is a generated login-shell
+wrapper (`~/.config/sandbox/daemon-claude.sh`), so the daemon gets the same PATH,
+pinned `GH_TOKEN` and `IS_SANDBOX` an interactive agent gets. Sessions it spawns
+start in `~/workspace` with permission prompts off, like the TUI.
+
+It needs the VM's agent **logged in once** (`sandbox acme claude` → `/login`);
+before that the unit fails, retries, and gives up after ten attempts — run
+`sandbox acme daemon restart` once you're logged in.
+
+Which daemons a project runs is `use_daemon <agent>` in its config, repeatable;
+unset means "this project's own agent, if it declares one" and `use_daemon none`
+turns them off. `sandbox <project> daemon off` stops and disables one for now —
+but `up` puts it back, so record the decision in the config. Existing VMs pick
+the unit up on their next start; nothing about the Lima template changes.
+
+> **What this widens.** While the VM runs, anyone who can reach your Claude
+> account can start prompt-free sessions in it — and the VM holds this project's
+> PATs and GPG signing key. That is the same exposure as leaving a
+> `--dangerously-skip-permissions` session open, only unattended. `use_daemon
+> none` if you'd rather opt out per project; `sandbox <project> stop` ends it.
 
 ## Per-project GitHub identities
 
