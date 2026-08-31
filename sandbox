@@ -40,7 +40,9 @@
 # it, and anything the VM sends back to the host is validated here before use.
 set -euo pipefail
 
-ROOT="${AI_SANDBOX_ROOT:-$HOME/ai-sandbox}"
+# Data (agents/, projects/, lima/) lives next to this script, wherever the repo
+# is checked out — resolve through symlinks so a PATH symlink still finds it.
+ROOT="${AI_SANDBOX_ROOT:-$(cd "$(dirname "$(readlink -f "$0")")" && pwd)}"
 TEMPLATE="$ROOT/lima/claude.yaml"
 HELPER_SRC="$ROOT/lima/cred-helper.sh"
 PROJECTS="$ROOT/projects"

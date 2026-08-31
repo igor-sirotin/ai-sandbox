@@ -58,7 +58,9 @@ sandbox <project> destroy      # delete the VM and everything in it
 projects (one with a config, or an existing VM) are accepted — an unrecognised
 name is an error listing the known projects, so a typo can't silently provision
 a whole new VM. Use `sandbox new <project>` to create one.
-(`sandbox` = `~/ai-sandbox/sandbox`, symlinked into `~/.local/bin`.)
+(`sandbox` = the `sandbox` script in this repo, symlinked into `~/.local/bin`;
+it finds its data (`agents/`, `projects/`, `lima/`) next to itself, or in
+`$AI_SANDBOX_ROOT` if set.)
 
 ### Renaming a project
 
