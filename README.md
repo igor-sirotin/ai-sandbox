@@ -281,6 +281,41 @@ lima-claude-<project>` — or add `portForwards` to `lima/claude.yaml`.
 > Toolchains live at fixed paths — Go `/usr/local/go`, Nim `/opt/nim`, Rust
 > `$HOME/.cargo` — in case an IDE's SDK auto-detect needs them pointed out.
 
+## GUI apps
+
+`sandbox <project>` and `sandbox <project> shell` connect over SSH with X11
+forwarding on, so a GUI app started in the VM opens as a window on your Mac.
+The one-time host setup is [XQuartz](https://www.xquartz.org):
+
+```sh
+brew install --cask xquartz     # then log out and back in
+```
+
+Test it:
+
+```sh
+sandbox acme shell
+echo $DISPLAY                          # expect localhost:10.0
+sudo apt-get install -y x11-apps       # in the VM, once
+xclock                                 # a window on your Mac
+```
+
+Empty `$DISPLAY` in the VM means no X server was found on the Mac — check
+`echo $DISPLAY` there too; it's set only after XQuartz has been installed *and*
+you've logged out and back in.
+
+No GPU is passed through, so this is software rendering: fine for widgets,
+browsers and Electron, useless for 3D. If a test suite just needs *a* display
+rather than one you can see, skip the Mac entirely and use a virtual one in
+the VM — `sudo apt-get install -y xvfb`, then `xvfb-run -a npm test`. For a full
+desktop instead of single windows, install `xfce4` + `tigervnc-standalone-server`
+in the VM and point macOS Screen Sharing at `vnc://localhost:5901`.
+
+> Why not `limactl shell`: it can't request X11 forwarding, and it holds a shared
+> master connection that a manual `ssh -Y` silently rides — inheriting the
+> master's lack of forwarding, so `-Y` appears to work while `$DISPLAY` stays
+> empty. The launcher opens its own connection (`ControlPath=none`) instead.
+
 ## Moving files in and out
 
 There are no host mounts. Each VM is an SSH host (see the IDE section above for the
@@ -388,6 +423,12 @@ as untrusted and the boundary as the thing doing the work.
   **fine-grained, least-privilege PATs** per project (Contents + PRs, plus GPG
   keys if you want signing-key auto-upload) so a leak is contained and
   individually revocable.
+- **X11 forwarding is trusted** (`ssh -Y`). X clients in the VM can read input
+  and other windows on your Mac's X server, so it is a small hole in the
+  boundary — limited to XQuartz, and only while you're connected, but real. It's
+  requested only when the Mac has `DISPLAY` set: no XQuartz, nothing forwarded.
+  Untrusted forwarding (`-X`) closes it but breaks enough toolkits that it isn't
+  the default; change `vm_login` in `sandbox` if you'd rather have it.
 - Resources capped per VM (4 CPUs / 8 GiB / 60 GiB — edit `lima/claude.yaml`).
   Stop idle VMs.
 

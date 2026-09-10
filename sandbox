@@ -284,7 +284,7 @@ run_agent() { # $1=agent, rest = args passed through to it
     if [ -n "${TERM_PROGRAM:-}" ];         then envargs+=("TERM_PROGRAM=$TERM_PROGRAM"); fi
     if [ -n "${TERM_PROGRAM_VERSION:-}" ]; then envargs+=("TERM_PROGRAM_VERSION=$TERM_PROGRAM_VERSION"); fi
     if [ -n "${COLORTERM:-}" ];            then envargs+=("COLORTERM=$COLORTERM"); fi
-    exec limactl shell "$INST" \
+    vm_login \
         env ${envargs[@]+"${envargs[@]}"} \
         bash -lc "$(agent_prelude)cd ~/workspace 2>/dev/null || cd ~; $_A_LAUNCH" _ "$@"
 }
@@ -461,6 +461,39 @@ ensure_daemons() {
 exists()  { limactl list -q 2>/dev/null | grep -qx "$INST"; }
 running() { [ "$(limactl list "$INST" --format '{{.Status}}' 2>/dev/null)" = "Running" ]; }
 vm()      { limactl shell "$INST" "$@"; }   # run a program in the VM
+
+shquote() {   # single-quote each argument, for a command line the remote shell re-parses
+    local out="" a
+    for a in "$@"; do out+=" '${a//\'/\'\\\'\'}'"; done
+    printf '%s' "${out# }"
+}
+
+# Interactive sessions get their own ssh connection instead of `limactl shell`,
+# so that GUI apps in the VM can open windows on the Mac. Two things make that
+# necessary: limactl offers no way to ask for X11 forwarding, and it holds a
+# shared master connection (ControlMaster) that a later `ssh -Y` silently rides
+# — inheriting the master's *lack* of forwarding, so the -Y looks like it worked
+# and $DISPLAY stays empty in the VM. Hence ControlPath=none: one connection per
+# session, an extra TCP handshake, and windows that actually open.
+#
+# -Y is *trusted* forwarding (see "Isolation & security" in the README). It is
+# requested only when the Mac has a DISPLAY, so a host without XQuartz keeps
+# exactly the old behaviour.
+vm_login() {   # exec an interactive session in the VM; args (optional) = remote argv
+    local cfg="${LIMA_HOME:-$HOME/.lima}/$INST/ssh.config"
+    if [ -f "$cfg" ]; then
+        local opts=(-F "$cfg" -o ControlMaster=no -o ControlPath=none)
+        if [ -n "${DISPLAY:-}" ]; then opts+=(-Y); fi
+        if [ -t 0 ]; then opts+=(-t); fi     # ssh gives a command no tty by default
+        if [ $# -gt 0 ]; then
+            exec ssh "${opts[@]}" "lima-$INST" "$(shquote "$@")"
+        fi
+        exec ssh "${opts[@]}" "lima-$INST"
+    fi
+    # Lima too old to write ssh.config, or an instance directory we can't find:
+    # no GUI windows, but everything else works as before.
+    exec limactl shell "$INST" "$@"
+}
 
 _VM_COLD=0     # did *this* invocation start the VM?
 ensure_up() {
@@ -1028,7 +1061,7 @@ case "$CMD" in
         ;;
     rename|mv)
         rename_project "$@" ;;
-    shell)    ensure_up; exec limactl shell "$INST" ;;
+    shell)    ensure_up; vm_login ;;
     code)     ensure_up
               command -v code >/dev/null 2>&1 || die "VS Code 'code' CLI not on PATH (install it / enable 'code' command)"
               ide_home="$(limactl shell "$INST" printenv HOME 2>/dev/null)"
