@@ -39,6 +39,7 @@ sandbox <project> agent run <name> [args...]  # run an agent explicitly
 sandbox <project> daemon       # background daemons (Claude Remote Control): state of each
 sandbox <project> daemon logs [-f]        # journal of a background daemon
 sandbox <project> daemon restart|off      # restart, or stop and disable one
+sandbox <project> mic          # microphone passthrough for voice input: status | on | off
 sandbox <project> shell        # interactive shell in the VM
 sandbox <project> code [path]  # open VS Code (Remote-SSH) in the VM
 sandbox <project> up           # create/start the VM (auto-applies identities)
@@ -173,6 +174,53 @@ the unit up on their next start; nothing about the Lima template changes.
 > PATs and GPG signing key. That is the same exposure as leaving a
 > `--dangerously-skip-permissions` session open, only unattended. `use_daemon
 > none` if you'd rather opt out per project; `sandbox <project> stop` ends it.
+
+### Voice input
+
+Claude Code has a `/voice` command — push-to-talk dictation, streamed to
+Anthropic for transcription. It records through **ALSA inside the VM**, and a
+Lima VM has no sound hardware at all, so `/voice` reports that no audio device
+is available. `sandbox <project> mic on` gives that project's VM a microphone:
+
+```sh
+sandbox acme mic on      # attach the Mac's mic; restarts the VM, installs the guest driver
+sandbox acme claude      # then, in the agent:  /voice
+sandbox acme mic         # status: config, limactl support, VM, guest
+sandbox acme mic off     # detach it again
+```
+
+Two halves have to line up, and `mic` does both:
+
+- **Host** — Lima's `vz` driver attaches a virtio-sound *capture* stream when
+  `audio.microphone` is set. It's opt-in upstream because it makes macOS ask for
+  microphone permission on behalf of the process running the VM: the first
+  recording raises the prompt, and you grant it to *your terminal*, not to the
+  sandbox. The flags go on the instance, not on
+  [`lima/claude.yaml`](lima/claude.yaml) — the template is shared by every
+  project, and only the ones that asked should be able to listen.
+- **Guest** — Ubuntu's cloud image ships no sound drivers. `virtio_snd` is built
+  as a module but lives in `linux-modules-extra`, which is versioned per kernel,
+  and `arecord` comes from `alsa-utils`. Both are installed on demand rather
+  than baked into the template, so VMs created before this existed pick it up,
+  and a kernel upgrade inside the VM gets the matching modules on the next start.
+
+The audio device is built when the VM boots, and `limactl` refuses to edit a
+running instance — so `mic on`/`mic off` stop the VM, change it, and start it
+again (you're asked first, and a VM that was running is put back).
+
+Which projects get a microphone is `use_mic on` in the project config; absent
+means off. `mic on` writes it for you, so `up` keeps applying it — including to
+a VM that doesn't exist yet, which is then *created* with the mic attached.
+
+> **What this widens.** A sandbox that can hear the room is a wider boundary
+> than one that can't: while the VM runs with a mic attached, anything in it can
+> open the capture device, not just the agent you meant to dictate to — and with
+> a background daemon running, with nobody in the room. It is off unless asked
+> for, per project, and `sandbox <project> mic off` takes it away again.
+
+> **Needs a Lima newer than v2.3.0-beta.0.** `audio.microphone` was merged
+> upstream on 2026-09-08 and is not in a release yet, so `mic on` checks for it
+> and tells you if your `limactl` is too old (`brew install --HEAD lima`).
 
 ## Per-project GitHub identities
 
@@ -399,3 +447,7 @@ reachable from your network. Destroying the VM does not cover the first two.
 
 Lima (`brew install lima`). VMs live in `~/.lima/claude-<project>/`. To spin up
 new projects faster you can provision one VM and `limactl clone` it.
+
+Voice input (`sandbox <project> mic`) additionally needs a Lima with
+`audio.microphone`, which is newer than v2.3.0-beta.0 — until it lands in a
+release, `brew install --HEAD lima`. Everything else works on stock Lima.
