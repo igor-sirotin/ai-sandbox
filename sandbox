@@ -15,6 +15,9 @@
 #                                                 name collides with a command)
 #   sandbox <project> daemon         background daemons (e.g. `claude remote-control`):
 #                                    ls | status | logs [-f] | start | stop | restart | install | off
+#   sandbox <project> mic            hand the VM the Mac's microphone, so the agent's
+#                                    own voice input (Claude Code's /voice) can hear you:
+#                                    status | on | off
 #   sandbox <project> shell          interactive shell in the VM
 #   sandbox <project> code [path]    open VS Code (Remote-SSH) in the VM
 #   sandbox <project> up             create/start the VM (auto-applies identities)
@@ -53,7 +56,7 @@ DEFAULT_AGENT="claude"
 
 # Commands are matched before the agent registry, so these names can never
 # resolve to an agent; `sandbox agents` warns if one is shadowed.
-BUILTIN_CMDS="up start auth keys set-email email rename mv shell code exec stop destroy delete status agent daemon daemons config conf audit"
+BUILTIN_CMDS="up start auth keys set-email email rename mv shell code exec stop destroy delete status agent daemon daemons mic microphone config conf audit"
 
 die() { echo "sandbox: $*" >&2; exit 1; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
@@ -152,6 +155,14 @@ use_agent() { _AGENT="$1"; }
 _DAEMONS=""
 use_daemon() { _DAEMONS="$_DAEMONS $1"; }
 
+# ...and `use_mic on` to attach the Mac's microphone to the VM, so an agent's
+# own voice input can hear you. Off unless asked for, and deliberately so: the
+# capture stream makes macOS ask for microphone permission on behalf of the
+# process running the VM, and a sandbox that can hear the room is a wider
+# boundary than one that can't. See `sandbox <project> mic`.
+_MIC=""
+use_mic() { _MIC="$1"; }
+
 # Resolve a path to the file it finally points at. The checks below must apply
 # to what actually gets sourced, not to a symlink standing in front of it:
 # `find` does not follow links (-P is the default) and a macOS symlink is 0755,
@@ -194,7 +205,7 @@ conf_path() {
     printf '%s' "$real"
 }
 load_project() {
-    _IDENTITIES=""; _AGENT=""; _DAEMONS=""
+    _IDENTITIES=""; _AGENT=""; _DAEMONS=""; _MIC=""
     local f="$PROJECTS/$1.conf" real
     [ -f "$f" ] || return 0
     real="$(conf_path "$f")" || exit 1
@@ -457,6 +468,204 @@ ensure_daemons() {
     return 0
 }
 
+# ------------------------------------------------------------------ microphone
+# Voice input belongs to the agent, not to this launcher: Claude Code's /voice
+# records 16 kHz mono through ALSA (arecord, or SoX's `rec`) from inside the VM
+# and streams it to Anthropic for transcription. So all the sandbox has to do is
+# make sure the VM *has* a microphone — everything above that is the agent's.
+#
+# Two halves have to line up:
+#   host   Lima's vz driver attaches a virtio-sound *capture* stream only when
+#          `audio.microphone` is set (opt-in upstream, because it makes macOS
+#          ask for microphone permission on behalf of limactl). It is ignored
+#          unless `audio.device` is set too.
+#   guest  Ubuntu's cloud image carries no sound drivers at all: virtio_snd is
+#          built as a module but ships in linux-modules-extra, which is
+#          versioned per kernel, and arecord comes from alsa-utils. Neither is
+#          in the base image, so both are installed on demand rather than at
+#          provision time — that way VMs created before this existed pick it up,
+#          and a kernel upgrade inside the VM gets the matching modules.
+#
+# The audio device is attached when the VM boots, so turning this on or off
+# means a stopped instance and a restart.
+
+mic_flag_on()  { case "${1:-}" in on|yes|true|1) return 0 ;; esac; return 1; }
+mic_flag_off() { case "${1:-}" in off|no|false|0|"") return 0 ;; esac; return 1; }
+
+mic_wanted() {   # does the project's config ask for a microphone?
+    load_project "$PROJECT"
+    if mic_flag_on "${_MIC:-}"; then return 0; fi
+    mic_flag_off "${_MIC:-}" || die "use_mic: expected on/off, got '$_MIC'"
+    return 1
+}
+
+# Feature-detect rather than compare versions: `audio.microphone` landed after
+# the current Lima release, so a version number would have to be guessed at.
+limactl_has_mic() { limactl start --help 2>&1 | grep -q -- '--audio-microphone'; }
+
+mic_needs_newer_lima() {
+    die "this limactl has no microphone support ($(limactl --version 2>/dev/null | head -1))
+  'audio.microphone' is newer than the current Lima release. Install a build that
+  has it (HEAD, or the first release after v2.3.0-beta.0):
+      brew install --HEAD lima
+  then re-run:  sandbox $PROJECT mic on"
+}
+
+# Read the instance's own config, not the template: the template is shared by
+# every project, and the microphone is a per-project choice.
+mic_instance_dir() { limactl list "$INST" --format '{{.Dir}}' 2>/dev/null; }
+mic_instance_on() {
+    local dir; dir="$(mic_instance_dir)" || return 1
+    [ -n "$dir" ] || return 1
+    grep -qE '^[[:space:]]*microphone:[[:space:]]*true([[:space:]]|$)' "$dir/lima.yaml" 2>/dev/null
+}
+
+mic_edit_instance() {   # $1 = on|off; the instance must exist and be stopped
+    if [ "$1" = on ]; then
+        limactl edit "$INST" --tty=false \
+            --audio-device vz --audio-interface virtio --audio-microphone=true
+    else
+        # 'none' is what upstream reads as "no sound device"; clearing the
+        # microphone too keeps the two from disagreeing if audio is re-enabled.
+        limactl edit "$INST" --tty=false \
+            --audio-device none --audio-microphone=false
+    fi
+}
+
+# The flags `limactl start` needs at *create* time, for a project that wants a
+# microphone from the outset. Echoed one per line so the caller can read them
+# into an array without word-splitting surprises.
+mic_create_flags() {
+    printf '%s\n' --audio-device vz --audio-interface virtio --audio-microphone=true
+}
+
+mic_guest_ready() { vm bash -lc 'command -v arecord >/dev/null 2>&1 && arecord -l 2>/dev/null | grep -q "^card "' </dev/null >/dev/null 2>&1; }
+
+setup_mic_guest() {   # assumes the VM is up
+    echo ">> guest: making sure the sound driver and ALSA tools are in..."
+    # linux-modules-extra is pinned to the *running* kernel, so ask for it by
+    # `uname -r` on every run: after a kernel upgrade the old package no longer
+    # provides a loadable virtio_snd.
+    vm bash -lc '
+        set -eu
+        export DEBIAN_FRONTEND=noninteractive
+        need=""
+        command -v arecord >/dev/null 2>&1 || need="alsa-utils"
+        modinfo virtio_snd >/dev/null 2>&1 || need="$need linux-modules-extra-$(uname -r)"
+        if [ -n "$need" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends $need
+        fi
+        sudo modprobe virtio_snd 2>/dev/null || true
+        echo virtio_snd | sudo tee /etc/modules-load.d/sandbox-mic.conf >/dev/null
+    ' </dev/null
+}
+
+# Called on a cold start, next to ensure_daemons: it is what makes a VM that
+# predates this feature pick it up.
+ensure_mic() {
+    mic_wanted || return 0
+    if ! mic_instance_on; then
+        echo "!! '$PROJECT' asks for a microphone (use_mic on) but VM '$INST' has none attached."
+        echo "   Attach it with:  sandbox $PROJECT mic on"
+        return 0
+    fi
+    mic_guest_ready || setup_mic_guest
+}
+
+mic_status() {
+    local conf_state="off" inst_state="-" guest_state="-" host_state="no"
+    if mic_wanted; then conf_state="on"; fi   # reports, and rejects a bogus use_mic value
+    limactl_has_mic && host_state="yes"
+    if exists; then
+        if mic_instance_on; then inst_state="attached"; else inst_state="not attached"; fi
+        if running; then
+            if mic_guest_ready; then guest_state="capture device present"; else guest_state="no capture device"; fi
+        else
+            guest_state="(VM stopped)"
+        fi
+    else
+        inst_state="(no VM)"
+    fi
+    echo "microphone for '$PROJECT':"
+    printf '  %-22s %s\n' "config (use_mic)" "$conf_state"
+    printf '  %-22s %s\n' "limactl supports it" "$host_state"
+    printf '  %-22s %s\n' "VM '$INST'" "$inst_state"
+    printf '  %-22s %s\n' "guest (arecord -l)" "$guest_state"
+    if [ "$conf_state" = on ] && [ "$inst_state" = attached ] && [ "$guest_state" = "capture device present" ]; then
+        echo
+        echo "   Ready. In the agent, turn dictation on with:  /voice"
+    elif [ "$host_state" = no ]; then
+        echo
+        echo "   limactl has no --audio-microphone — see: sandbox $PROJECT mic on"
+    else
+        echo
+        echo "   Turn it on with:  sandbox $PROJECT mic on"
+    fi
+}
+
+# Rewrite `use_mic` in the project config, the way `agent default` rewrites
+# use_agent: through conf_path, so a config symlinked out of a dotfiles
+# checkout keeps its symlink, and atomically, so a failure never leaves half a
+# config behind.
+mic_write_conf() {   # $1 = on|off
+    local conf tmp
+    conf="$PROJECTS/$PROJECT.conf"
+    [ -f "$conf" ] || die "no config $conf — run: sandbox new $PROJECT"
+    conf="$(conf_path "$conf")" || exit 1
+    tmp="$(mktemp)"
+    awk -v v="$1" '
+        /^[[:space:]]*use_mic[[:space:]]/ { if (!done) { print "use_mic " v; done=1 } next }
+        { print }
+        END { if (!done) { print ""; print "# microphone passthrough for the agent'"'"'s voice input"; print "use_mic " v } }' \
+        "$conf" > "$tmp"
+    mv "$tmp" "$conf" || { rm -f "$tmp"; die "could not update $conf"; }
+    chmod 600 "$conf"
+    echo ">> use_mic $1 ($conf)"
+}
+
+mic_set() {   # $1 = on|off
+    local state="$1" was_running=0
+    [ "$state" != on ] || limactl_has_mic || mic_needs_newer_lima
+    mic_write_conf "$state"
+
+    if ! exists; then
+        echo ">> no VM '$INST' yet — it will be created with the microphone $state."
+        return 0
+    fi
+    if mic_instance_on && [ "$state" = on ]; then
+        echo ">> VM '$INST' already has a microphone attached."
+    else
+        # The sound device is built when the VM boots, and limactl refuses to
+        # edit a running instance — so this is a stop, an edit and a start.
+        if running; then
+            echo "!! '$INST' is running — the microphone is attached at boot, so it has to restart."
+            confirm "Stop it now?" "Y" || die "aborted — the config says use_mic $state, but the VM is unchanged
+  apply it later with:  sandbox $PROJECT mic $state"
+            limactl stop "$INST"
+            was_running=1   # put it back the way we found it
+        fi
+        mic_edit_instance "$state"
+        echo ">> VM '$INST': microphone $state"
+    fi
+
+    if [ "$state" = on ]; then
+        ensure_up                              # a cold start already runs ensure_mic
+        mic_guest_ready || setup_mic_guest     # ...so only do the guest half if it didn't
+        if mic_guest_ready; then
+            echo ">> the VM can hear you. In the agent, turn dictation on with:  /voice"
+            echo "   macOS will ask for microphone permission the first time — it asks on"
+            echo "   behalf of the app running the VM, so grant it to your terminal."
+        else
+            echo "!! no capture device in the guest yet. Check it with:"
+            echo "     sandbox $PROJECT exec 'arecord -l'"
+            echo "   and the driver with:  sandbox $PROJECT exec 'dmesg | grep -i virtio_snd'"
+        fi
+    elif [ "$was_running" = 1 ]; then
+        ensure_up   # it was up before; don't leave it stopped just to detach a device
+    fi
+}
+
 # --------------------------------------------------------------- VM lifecycle
 exists()  { limactl list -q 2>/dev/null | grep -qx "$INST"; }
 running() { [ "$(limactl list "$INST" --format '{{.Status}}' 2>/dev/null)" = "Running" ]; }
@@ -466,8 +675,16 @@ _VM_COLD=0     # did *this* invocation start the VM?
 ensure_up() {
     _VM_COLD=0
     if ! exists; then
+        # The microphone is a create-time flag rather than a template key: the
+        # template is shared by every project, and only projects that asked for
+        # one should make macOS prompt for microphone access.
+        local mic_flags=()
+        if mic_wanted; then
+            limactl_has_mic || mic_needs_newer_lima
+            while IFS= read -r f; do mic_flags+=("$f"); done < <(mic_create_flags)
+        fi
         echo ">> creating VM '$INST' (first run provisions toolchains — a few minutes)..."
-        limactl start --name "$INST" --tty=false "$TEMPLATE"
+        limactl start --name "$INST" --tty=false ${mic_flags[@]+"${mic_flags[@]}"} "$TEMPLATE"
         configure_identities   # auto-apply project auth on first create
         _VM_COLD=1
     elif ! running; then
@@ -477,7 +694,7 @@ ensure_up() {
     # Background daemons are *enabled* systemd units, so once installed they
     # come up with the VM on their own — no need to poke them on every command.
     # Installing them here is what makes them appear on a VM that predates them.
-    if [ "$_VM_COLD" = 1 ]; then ensure_daemons; fi
+    if [ "$_VM_COLD" = 1 ]; then ensure_daemons; ensure_mic; fi
 }
 
 configure_identities() { # assumes VM is up
@@ -1028,6 +1245,15 @@ case "$CMD" in
         ;;
     rename|mv)
         rename_project "$@" ;;
+    mic|microphone)
+        # No ensure_up: `mic on` may have to stop the VM anyway, and `mic
+        # status` should be answerable without booting one.
+        case "${1:-status}" in
+            status|"")     mic_status ;;
+            on|yes|true|1) mic_set on ;;
+            off|no|false|0) mic_set off ;;
+            *) die "usage: sandbox $PROJECT mic [status|on|off]" ;;
+        esac ;;
     shell)    ensure_up; exec limactl shell "$INST" ;;
     code)     ensure_up
               command -v code >/dev/null 2>&1 || die "VS Code 'code' CLI not on PATH (install it / enable 'code' command)"

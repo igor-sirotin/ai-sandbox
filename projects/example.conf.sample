@@ -26,6 +26,13 @@ use_agent claude
 # Omit for "the agent above, if it declares one"; `use_daemon none` disables.
 # use_daemon claude
 
+# Microphone passthrough, so the agent's own voice input (Claude Code's /voice)
+# can hear you. Off unless set: the capture stream makes macOS ask for microphone
+# permission on behalf of the VM's process, and a sandbox that can hear the room
+# is a wider boundary than one that can't. `sandbox <project> mic on` writes this
+# and applies it to the VM; `sandbox <project> mic` reports where it stands.
+# use_mic on
+
 # Optional: a second account whose token is used only for repos under one org.
 # Routing is by longest "<host>/<org>" match; everything else uses the primary.
 # add_identity \
@@ -44,3 +51,4 @@ use_agent claude
 # use_agent <name>     agent for a bare `sandbox <project>` (default: claude)
 # use_daemon <name>    agent whose background daemon the VM keeps running
 #                      (repeatable; default: the use_agent one; 'none' = off)
+# use_mic <on|off>     attach the Mac's microphone to this VM (default: off)

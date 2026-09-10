@@ -35,6 +35,12 @@ disk: "60GiB"
 # host, or with git.
 mounts: []
 
+# No `audio:` here on purpose. A microphone is a per-project choice, not a
+# property of every sandbox, so it is set on the instance instead — see
+# `sandbox <project> mic on`, which passes --audio-device/--audio-microphone to
+# limactl. Putting it in the template would make macOS prompt for microphone
+# access for every VM this launcher creates.
+
 # Don't trust the host's personal SSH keys; Lima's own generated key still works.
 ssh:
   loadDotSSHPubKeys: false
