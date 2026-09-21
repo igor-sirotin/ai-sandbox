@@ -43,6 +43,7 @@ sandbox <project> shell        # interactive shell in the VM
 sandbox <project> code [path]  # open VS Code (Remote-SSH) in the VM
 sandbox <project> up           # create/start the VM (auto-applies identities)
 sandbox <project> auth         # re-apply identities/tokens (after edits/rotation)
+sandbox <project> secret [user]  # replace a token (e.g. expired), then auth + audit
 sandbox <project> keys         # (re)create GPG signing key, add to GitHub, verify
 sandbox <project> set-email <email>  # change the git email (regenerates the GPG key)
 sandbox <project> rename <new>       # rename the project (config, VM, Keychain items)
@@ -211,6 +212,14 @@ add_identity \
   It **wipes the VM's existing `gh` login and credential file first**, so an
   identity you removed from the config — or a token you rotated — stops working
   inside the VM instead of lingering.
+- **Replacing a token** (it expired, or you're rotating it): `sandbox <project>
+  secret`. It looks the Keychain name up in the config, so you don't have to
+  remember it. Pass a GitHub username or Keychain name to choose an identity, or
+  pick one from a list if the project has several. Then it stores the new value
+  (`security` prompts for it, so it never goes on the command line), runs `auth`
+  and `audit`, and names any other project whose config uses the same Keychain
+  item, since those projects need their own `auth`. The config file doesn't
+  change. If the VM doesn't exist yet, the token is applied by the next `up`.
 - `projects/*.conf` is **executed as shell code** (it's a tiny shell DSL). The
   launcher refuses to read one that isn't owned by you or that is group/world
   writable; keep them `chmod 600`, as `sandbox new` writes them.
