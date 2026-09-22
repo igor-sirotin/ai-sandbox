@@ -24,6 +24,7 @@
 #   sandbox <project> keys           ensure GPG signing key, add to GitHub, verify
 #   sandbox <project> set-email <email>  change the git email (regenerates GPG signing key)
 #   sandbox <project> rename <new>   rename the project: config, VM and Keychain items
+#   sandbox <project> migrate        rename a legacy claude-<project> VM to ai-sandbox-<project>
 #   sandbox <project> config [--edit]    show (or edit) the project's config file
 #   sandbox <project> audit          report which GitHub credential the VM holds
 #   sandbox <project> exec CMD...    run a command in the VM
@@ -49,13 +50,14 @@ TEMPLATE="$ROOT/lima/claude.yaml"
 HELPER_SRC="$ROOT/lima/cred-helper.sh"
 PROJECTS="$ROOT/projects"
 AGENTS="$ROOT/agents"
-PREFIX="claude-"
+PREFIX="ai-sandbox-"
+LEGACY_PREFIX="claude-"    # VMs created before the rename; still used until migrated
 KC_PREFIX="ai-sandbox"     # Keychain service prefix
 DEFAULT_AGENT="claude"
 
 # Commands are matched before the agent registry, so these names can never
 # resolve to an agent; `sandbox agents` warns if one is shadowed.
-BUILTIN_CMDS="up start auth keys set-email email rename mv shell code exec stop destroy delete status agent daemon daemons config conf audit secret token"
+BUILTIN_CMDS="up start auth keys set-email email rename mv migrate shell code exec stop destroy delete status agent daemon daemons config conf audit secret token"
 
 die() { echo "sandbox: $*" >&2; exit 1; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
@@ -238,7 +240,7 @@ token_is_narrow() { [ "$(token_kind "${1:-}")" = "fine-grained" ]; }
 # Known projects = those with a config, plus any existing VM (config-less ones).
 project_list() {
     { ls "$PROJECTS"/*.conf 2>/dev/null | sed 's|.*/||; s|\.conf$||'
-      limactl list -q 2>/dev/null | sed -n "s|^${PREFIX}||p"
+      limactl list -q 2>/dev/null | sed -n -e "s|^${PREFIX}||p" -e "s|^${LEGACY_PREFIX}||p"
     } | sort -u
 }
 agent_exists() { [ -n "${1:-}" ] && [ -f "$AGENTS/$1.conf" ]; }
@@ -461,6 +463,18 @@ ensure_daemons() {
 
 # --------------------------------------------------------------- VM lifecycle
 exists()  { limactl list -q 2>/dev/null | grep -qx "$INST"; }
+
+# The VM for a project: ai-sandbox-<project>, or the claude-<project> it was
+# called before the rename, as long as that one hasn't been migrated. Existing
+# VMs keep working under the old name; `sandbox <project> migrate` renames one.
+inst_for() {
+    local vms; vms="$(limactl list -q 2>/dev/null || true)"
+    if ! grep -qx "${PREFIX}$1" <<<"$vms" && grep -qx "${LEGACY_PREFIX}$1" <<<"$vms"; then
+        echo "${LEGACY_PREFIX}$1"
+    else
+        echo "${PREFIX}$1"
+    fi
+}
 running() { [ "$(limactl list "$INST" --format '{{.Status}}' 2>/dev/null)" = "Running" ]; }
 vm()      { limactl shell "$INST" "$@"; }   # run a program in the VM
 
@@ -891,7 +905,7 @@ new_project() {
     fi
 
     echo; echo "Wrote $conf"
-    PROJECT="$proj"; INST="${PREFIX}${proj}"
+    PROJECT="$proj"; INST="$(inst_for "$proj")"
     confirm "Create and provision the VM now (~5-10 min)?" "Y" || { echo "Later: sandbox $proj up"; return 0; }
     ensure_up
     confirm "Generate GPG signing key and add to GitHub?" "Y" && setup_keys
@@ -1077,7 +1091,9 @@ rename_project() { # $1 = the new name for $PROJECT
     if [ -e "$nconf" ] || [ -L "$nconf" ]; then   # -L too: -e is false for a dangling link
         die "$nconf already exists — pick another name"
     fi
-    ! limactl list -q 2>/dev/null | grep -qx "$ninst" || die "a VM named '$ninst' already exists — pick another name"
+    local vm; for vm in "$ninst" "${LEGACY_PREFIX}$new"; do
+        ! limactl list -q 2>/dev/null | grep -qx "$vm" || die "a VM named '$vm' already exists — pick another name"
+    done
 
     # The VM goes first: it is the step that can fail, and a config renamed
     # ahead of it would be left describing a project with no VM.
@@ -1114,13 +1130,42 @@ rename_project() { # $1 = the new name for $PROJECT
     echo ">> '$old' is now '$new'.  Run:  sandbox $new"
 }
 
+# ---------------------------------------------------------------- migrate
+# claude-<project> -> ai-sandbox-<project>. Only the VM's name changes: the
+# config, Keychain items and everything inside the VM stay as they are.
+migrate_project() {
+    local ninst="${PREFIX}$PROJECT"
+    if [ "$INST" = "$ninst" ]; then
+        if exists; then echo ">> '$INST' already uses the current name"; else echo ">> no VM for '$PROJECT' — nothing to migrate"; fi
+        # Both names taken: the old VM is shadowed, and nothing here deletes a VM for you.
+        if limactl list -q 2>/dev/null | grep -qx "${LEGACY_PREFIX}$PROJECT"; then
+            echo "   !! '${LEGACY_PREFIX}$PROJECT' also exists and is no longer used — inspect it, then: limactl delete ${LEGACY_PREFIX}$PROJECT"
+        fi
+        return 0
+    fi
+    exists || die "no VM '$INST' to migrate"
+    if running; then
+        echo "!! '$INST' is running — it has to be stopped to be renamed (attached sessions end)."
+        confirm "Stop it now?" "Y" || die "aborted — nothing was changed"
+        limactl stop "$INST"
+    fi
+    rename_vm "$INST" "$ninst"
+    INST="$ninst"
+    echo ">> '$PROJECT' now runs in '$INST'. VS Code / ssh / scp: the host is now lima-$INST"
+}
+
 # ------------------------------------------------------------------- dispatch
 case "${1:-}" in
     ""|-h|--help|help) usage; exit 0 ;;
     new) new_project "${2:-}"; exit 0 ;;
     ls|list)
         echo "sandbox VMs:"
-        limactl list 2>/dev/null | awk -v p="^${PREFIX}" 'NR==1 || $1 ~ p' || true
+        limactl list 2>/dev/null | awk -v p="^${PREFIX}" -v l="^${LEGACY_PREFIX}" 'NR==1 || $1 ~ p || $1 ~ l' || true
+        legacy=""
+        for p in $(limactl list -q 2>/dev/null | sed -n "s|^${LEGACY_PREFIX}||p"); do
+            [ "$(inst_for "$p")" = "${LEGACY_PREFIX}$p" ] && legacy+="$p "
+        done
+        [ -z "$legacy" ] || echo ">> old-style ${LEGACY_PREFIX}* names: ${legacy% } — rename with: sandbox <project> migrate"
         exit 0 ;;
     agents)
         echo "agents (agents/*.conf, default: $DEFAULT_AGENT):"
@@ -1146,7 +1191,7 @@ esac
 
 PROJECT="$1"; shift || true
 valid_ident "$PROJECT" || die "invalid project name: $PROJECT"
-INST="${PREFIX}${PROJECT}"
+INST="$(inst_for "$PROJECT")"
 CMD="${1:-$(project_agent "$PROJECT")}"; shift || true
 
 # Typo guard: never provision a VM for a project we've never heard of. A project
@@ -1195,6 +1240,9 @@ case "$CMD" in
         ;;
     rename|mv)
         rename_project "$@" ;;
+    migrate)
+        [ $# -eq 0 ] || die "usage: sandbox $PROJECT migrate"
+        migrate_project ;;
     shell)    ensure_up; vm_login ;;
     code)     ensure_up
               command -v code >/dev/null 2>&1 || die "VS Code 'code' CLI not on PATH (install it / enable 'code' command)"
