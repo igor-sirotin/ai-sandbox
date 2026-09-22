@@ -47,6 +47,7 @@ sandbox <project> secret [user]  # replace a token (e.g. expired), then auth + a
 sandbox <project> keys         # (re)create GPG signing key, add to GitHub, verify
 sandbox <project> set-email <email>  # change the git email (regenerates the GPG key)
 sandbox <project> rename <new>       # rename the project (config, VM, Keychain items)
+sandbox <project> migrate            # rename an old claude-<project> VM to ai-sandbox-<project>
 sandbox <project> config [--edit]    # show (or edit) the project's config file
 sandbox <project> audit              # report which GitHub credential the VM holds
 sandbox <project> exec 'go test ./...'
@@ -55,7 +56,7 @@ sandbox <project> stop         # stop (disk kept)
 sandbox <project> destroy      # delete the VM and everything in it
 ```
 
-`<project>` maps to an isolated Lima VM `claude-<project>`. Only **known**
+`<project>` maps to an isolated Lima VM `ai-sandbox-<project>`. Only **known**
 projects (one with a config, or an existing VM) are accepted — an unrecognised
 name is an error listing the known projects, so a typo can't silently provision
 a whole new VM. Use `sandbox new <project>` to create one.
@@ -70,7 +71,7 @@ sandbox acme rename widgets
 ```
 
 Renames all three things a project's name is attached to: `projects/acme.conf`
-becomes `projects/widgets.conf`, the VM `claude-acme` becomes `claude-widgets`,
+becomes `projects/widgets.conf`, the VM `ai-sandbox-acme` becomes `ai-sandbox-widgets`,
 and the Keychain items `acme-<user>` become `widgets-<user>` (asked for
 separately, and the config's `--token-keychain` values are repointed for you).
 A token that another project's config also references keeps its name.
@@ -79,7 +80,7 @@ The VM has to be stopped — you're offered to stop it. Lima has no rename, so t
 instance is cloned under the new name and the old one deleted; on APFS the clone
 reflinks the disk, so nothing is copied twice. Nothing inside the VM changes:
 the workspace, tokens and GPG signing key are the same ones, and no `auth` or
-`keys` re-run is needed. The guest's own hostname keeps saying `lima-claude-acme`
+`keys` re-run is needed. The guest's own hostname keeps saying `lima-ai-sandbox-acme`
 until the VM is re-created — cosmetic.
 
 Background daemons name their session after the project (`sandbox-acme` on
@@ -87,6 +88,23 @@ claude.ai), so the next start re-installs them as `sandbox-widgets`; the rename
 says so when the project runs any.
 
 A config symlinked out of a dotfiles checkout stays a symlink, renamed in place.
+
+### VMs from before the `ai-sandbox-` prefix
+
+VMs used to be called `claude-<project>`. They keep working as they are: when a
+project has no `ai-sandbox-<project>` VM but does have a `claude-<project>` one,
+every command uses the old one, and `sandbox ls` lists both kinds and names the
+projects still on the old name. Only new VMs get the new name. To move one over:
+
+```sh
+sandbox acme migrate      # claude-acme -> ai-sandbox-acme
+```
+
+Same mechanism as a rename (VM stopped, cloned, old one deleted), but only the
+VM's name changes — config, Keychain items and daemon names stay put. Afterwards
+the ssh host is `lima-ai-sandbox-acme`, so re-pick it in VS Code / JetBrains and
+update any `scp`/`rsync` aliases. `rename` also moves a project onto the new
+prefix.
 
 ## Agents
 
@@ -276,16 +294,16 @@ the VMs visible to `ssh` and your IDE:
 Include ~/.lima/*/ssh.config
 ```
 
-That exposes each VM as `lima-claude-<project>`. Then:
+That exposes each VM as `lima-ai-sandbox-<project>`. Then:
 
 - **VS Code / Cursor** — `sandbox <project> code` opens Remote-SSH straight into
-  `~/workspace` in the VM. (Or: *Remote-SSH: Connect to Host…* → `lima-claude-<project>`.)
+  `~/workspace` in the VM. (Or: *Remote-SSH: Connect to Host…* → `lima-ai-sandbox-<project>`.)
 - **JetBrains (GoLand/CLion/…)** — *Remote Development → SSH* → host
-  `lima-claude-<project>` → choose the IDE backend → open `~/workspace`.
+  `lima-ai-sandbox-<project>` → choose the IDE backend → open `~/workspace`.
 
 Running services: when a process listens on a port in the VM, VS Code auto-forwards
 it to `localhost`. Otherwise tunnel it yourself — `ssh -L 8080:localhost:8080
-lima-claude-<project>` — or add `portForwards` to `lima/claude.yaml`.
+lima-ai-sandbox-<project>` — or add `portForwards` to `lima/claude.yaml`.
 
 > Toolchains live at fixed paths — Go `/usr/local/go`, Nim `/opt/nim`, Rust
 > `$HOME/.cargo` — in case an IDE's SDK auto-detect needs them pointed out.
@@ -331,9 +349,9 @@ There are no host mounts. Each VM is an SSH host (see the IDE section above for 
 one-time `~/.ssh/config` include), so use the tools you already have:
 
 ```sh
-scp lima-claude-acme:workspace/out/report.md .       # pull a file
-scp notes.md lima-claude-acme:workspace/             # push a file
-rsync -av lima-claude-acme:workspace/out/ ./out/     # pull a tree
+scp lima-ai-sandbox-acme:workspace/out/report.md .       # pull a file
+scp notes.md lima-ai-sandbox-acme:workspace/             # push a file
+rsync -av lima-ai-sandbox-acme:workspace/out/ ./out/     # pull a tree
 ```
 
 For code, prefer `git` — that's what the per-project identity and signing key are
@@ -421,7 +439,7 @@ as untrusted and the boundary as the thing doing the work.
   not from you: any process running as your user can call `security` and read
   them back without a prompt, the same as it could read `~/.lima`.
 - **Secrets inside the VM are plaintext-at-rest** in the VM disk image at
-  `~/.lima/claude-<project>/` — the `gh` token (`~/.config/gh`), the git
+  `~/.lima/ai-sandbox-<project>/` — the `gh` token (`~/.config/gh`), the git
   credentials file, the GPG signing key, and each agent's own login
   (`~/.claude`, `~/.local/share/opencode/auth.json`). That disk is protected by:
   - **FileVault** (whole-disk encryption at rest) — safe if the Mac is off/stolen;
@@ -447,5 +465,5 @@ reachable from your network. Destroying the VM does not cover the first two.
 
 ## Requirements
 
-Lima (`brew install lima`). VMs live in `~/.lima/claude-<project>/`. To spin up
+Lima (`brew install lima`). VMs live in `~/.lima/ai-sandbox-<project>/`. To spin up
 new projects faster you can provision one VM and `limactl clone` it.
