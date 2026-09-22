@@ -28,6 +28,10 @@
 #   sandbox <project> session [ls]   list the Claude sessions in the VM
 #   sandbox <project> session copy <id|--all> <other-project>
 #                                    copy Claude sessions into another project's VM
+#   sandbox <project> session export <id|--all> [file|-]
+#                                    write Claude sessions to a file (or stdout)
+#   sandbox <project> session import <file|->
+#                                    load an export, e.g. one made on another machine
 #   sandbox <project> config [--edit]    show (or edit) the project's config file
 #   sandbox <project> audit          report which GitHub credential the VM holds
 #   sandbox <project> exec CMD...    run a command in the VM
@@ -1173,21 +1177,13 @@ for f in files:
 PY
 }
 
-session_copy() { # <id|id-prefix|--all> <dest-project>
-    local what="${1:-}" dest="${2:-}" all=0
-    [ $# -eq 2 ] && [ -n "$what" ] && [ -n "$dest" ] \
-        || die "usage: sandbox $PROJECT session copy <session-id|--all> <other-project>"
+# Resolve <id|id-prefix|--all> in this VM: _S_PATHS gets the paths (relative to
+# ~/.claude) that make it up, one per line; _S_ID the full id (empty for --all).
+session_paths() {
+    local what="$1" all=0 list
     if [ "$what" = "--all" ]; then all=1
     else [[ "$what" =~ ^[0-9a-f-]{4,36}$ ]] || die "not a session id: '$what' (see: sandbox $PROJECT session ls)"
     fi
-    valid_ident "$dest" || die "invalid project name: $dest"
-    [ "$dest" != "$PROJECT" ] || die "'$dest' is this project"
-    local dinst; dinst="$(inst_for "$dest")"
-    limactl list -q 2>/dev/null | grep -qx "$dinst" || die "no VM for '$dest' ($dinst) — create it first: sandbox $dest up"
-
-    ensure_up
-    # What to send, resolved in the source VM: paths relative to ~/.claude.
-    local list
     list="$(vm env ALL="$all" ID="$what" bash -c '
         cd ~/.claude 2>/dev/null || exit 0
         shopt -s nullglob
@@ -1206,35 +1202,124 @@ session_copy() { # <id|id-prefix|--all> <dest-project>
         "!0") die "no session '$what' in $INST (see: sandbox $PROJECT session ls)" ;;
         "!"*) die "'$what' matches ${list#!} sessions in $INST — give more of the id" ;;
     esac
+    _S_PATHS="$list"; _S_ID=""
+    [ "$all" = 1 ] || _S_ID="$(basename "$(printf '%s\n' "$list" | head -1)" .jsonl)"
+}
 
-    local id="" n
-    if [ "$all" = 1 ]; then
-        n="$(vm bash -c 'ls ~/.claude/projects/*/*.jsonl 2>/dev/null | wc -l' | tr -d ' ')"
-        echo ">> $INST -> $dinst: all $n Claude session(s)"
-    else
-        id="$(basename "$(printf '%s\n' "$list" | head -1)" .jsonl)"
-        echo ">> $INST -> $dinst: session $id"
+# An export is a plain tar of those paths, plus sandbox-export.txt recording the
+# source VM's $HOME: session folders are named after the working directory, so
+# an import into a VM with a different HOME (another Mac, another username)
+# renames them to match. Everything but the tar itself goes to stderr, so
+# `export ... -` can feed a pipe.
+session_export() { # <id|--all> [file|-]
+    local what="${1:-}" out="${2:-}"
+    [ $# -ge 1 ] && [ $# -le 2 ] && [ -n "$what" ] \
+        || die "usage: sandbox $PROJECT session export <session-id|--all> [file|-]"
+    ensure_up >&2
+    session_paths "$what"
+    if [ -z "$out" ]; then
+        if [ -n "$_S_ID" ]; then out="claude-session-$PROJECT-${_S_ID:0:8}.tar"
+        else out="claude-sessions-$PROJECT.tar"; fi
     fi
-    # The VM is a project boundary; a transcript is everything that crossed it.
-    echo "   A transcript holds every tool output, including any token or file it showed —"
-    echo "   copying it gives '$dest' what '$PROJECT' saw."
-    confirm "Copy?" "Y" || die "aborted — nothing was copied"
+    if [ "$out" = "-" ]; then
+        [ ! -t 1 ] || die "refusing to write a tar archive to the terminal — pipe it, or give a file name"
+    else
+        [ ! -e "$out" ] || die "$out already exists"
+    fi
+    {
+        if [ -n "$_S_ID" ]; then echo ">> exporting session $_S_ID from $INST"
+        else echo ">> exporting all $(printf '%s\n' "$_S_PATHS" | wc -l | tr -d ' ') session folder(s) from $INST"; fi
+        # The VM is a project boundary; a transcript is everything that crossed it.
+        echo "   A transcript holds every tool output, including any token or file it showed —"
+        echo "   whoever imports it sees what '$PROJECT' saw."
+    } >&2
+    confirm "Continue?" "Y" || die "aborted — nothing was exported"
 
-    ( PROJECT="$dest"; INST="$dinst"; ensure_up ) || die "could not start $dinst"
-    # Same HOME in both VMs means the same encoded directory, so /resume finds it.
-    local shome dhome
-    shome="$(vm printenv HOME)"; dhome="$(limactl shell "$dinst" printenv HOME)"
-    vm env LIST="$list" bash -c 'cd ~/.claude && printf "%s\n" "$LIST" | tar -cf - -T -' \
-        | limactl shell "$dinst" bash -c 'mkdir -p ~/.claude && tar -C ~/.claude -xf - --skip-old-files' \
-        || die "copy failed"
-    echo ">> copied (anything already in $dinst was left as it is)"
-    [ "$shome" = "$dhome" ] || echo "   !! HOME differs ($shome vs $dhome): /resume in '$dest' looks under a different directory name"
-    if [ -n "$id" ]; then
-        echo "   resume it with:  sandbox $dest claude --resume $id"
+    local stream='t="$(mktemp -d)"; trap "rm -rf \"$t\"" EXIT
+        printf "home=%s\n" "$HOME" > "$t/sandbox-export.txt"
+        printf "%s\n" "$LIST" | tar -cf - -C "$t" sandbox-export.txt -C "$HOME/.claude" -T -'
+    if [ "$out" = "-" ]; then
+        vm env LIST="$_S_PATHS" bash -c "$stream" || die "export failed"
     else
-        echo "   pick one with:   sandbox $dest claude --resume"
+        # Transcripts can hold secrets: owner-only, and never a half-written file.
+        ( umask 077; vm env LIST="$_S_PATHS" bash -c "$stream" > "$out.part" ) \
+            || { rm -f "$out.part"; die "export failed"; }
+        mv "$out.part" "$out"
+        echo ">> wrote $out — on the other machine:  sandbox <project> session import $out" >&2
     fi
-    echo "   (only the conversation moved — the code it worked on is still in $INST)"
+}
+
+# Only session files are accepted — nothing outside projects/, file-history/
+# and todos/, no '..', no links — and nothing already in the VM is overwritten.
+session_import() { # <file|->
+    local in="${1:-}"
+    [ $# -eq 1 ] && [ -n "$in" ] || die "usage: sandbox $PROJECT session import <file|->"
+    exists || die "no VM '$INST' — create it first: sandbox $PROJECT up"
+    local src="$in" tmp=""
+    if [ "$in" = "-" ]; then
+        [ ! -t 0 ] || die "stdin is a terminal — pipe an export in, or give a file name"
+        tmp="$(mktemp)"; src="$tmp"
+        cat > "$tmp" || { rm -f "$tmp"; die "could not read stdin"; }
+    else
+        [ -f "$in" ] || die "no such file: $in"
+    fi
+    [ -s "$src" ] || { rm -f "$tmp"; die "nothing to import (empty input)"; }
+    local names types n bad=""
+    names="$(tar -tf "$src" 2>/dev/null)" || { rm -f "$tmp"; die "not a tar archive: $in"; }
+    while IFS= read -r n; do
+        case "$n" in
+            sandbox-export.txt|projects|projects/*|file-history|file-history/*|todos|todos/*) ;;
+            *) bad="unexpected path '$n'"; break ;;
+        esac
+        case "/$n/" in */../*) bad="'..' in '$n'"; break ;; esac
+    done <<<"$names"
+    # ls-style listing: first column is the type — only files and directories.
+    types="$(tar -tvf "$src" | cut -c1 | sort -u | tr -d '\n')"
+    case "$types" in *[!-d]*) [ -n "$bad" ] || bad="links or special files" ;; esac
+    [ -z "$bad" ] || { rm -f "$tmp"; die "not a session export ($bad) — nothing imported"; }
+
+    ensure_up
+    local ids
+    ids="$(vm bash -c '
+        set -e
+        s="$(mktemp -d)"; trap "rm -rf \"$s\"" EXIT
+        tar -C "$s" -xf - --no-same-owner
+        src="$(sed -n "s/^home=//p" "$s/sandbox-export.txt" 2>/dev/null || true)"
+        rm -f "$s/sandbox-export.txt"
+        enc() { printf "%s" "$1" | sed "s/[^A-Za-z0-9]/-/g"; }
+        if [ -n "$src" ] && [ "$src" != "$HOME" ] && [ -d "$s/projects" ]; then
+            from="$(enc "$src")"; to="$(enc "$HOME")"
+            for d in "$s/projects/"*; do
+                b="${d##*/}"
+                case "$b" in "$from"|"$from"-*) ;; *) continue ;; esac
+                nb="$to${b#"$from"}"
+                if [ -e "$s/projects/$nb" ]; then echo "   !! $b and $nb both present — left $b as is" >&2; continue; fi
+                mv "$d" "$s/projects/$nb"
+                echo "   re-homed $b -> $nb ($src -> $HOME)" >&2
+            done
+        fi
+        mkdir -p ~/.claude
+        (cd "$s" && tar -cf - .) | tar -C ~/.claude -xf - --skip-old-files
+        cd "$s" && ls projects/*/*.jsonl 2>/dev/null | sed "s|.*/||; s|\.jsonl$||" || true' < "$src")" \
+        || { rm -f "$tmp"; die "import into $INST failed"; }
+    rm -f "$tmp"
+    n="$(printf '%s' "$ids" | grep -c . || true)"
+    echo ">> imported $n session(s) into $INST (anything already there was left as it is)"
+    if [ "$n" = 1 ]; then echo "   resume it with:  sandbox $PROJECT claude --resume $ids"
+    else echo "   pick one with:   sandbox $PROJECT claude --resume"; fi
+    echo "   (only the conversation moved — the code it worked on is not part of it)"
+}
+
+# Same machine: export straight into the other project's import.
+session_copy() { # <id|id-prefix|--all> <dest-project>
+    local what="${1:-}" dest="${2:-}"
+    [ $# -eq 2 ] && [ -n "$what" ] && [ -n "$dest" ] \
+        || die "usage: sandbox $PROJECT session copy <session-id|--all> <other-project>"
+    valid_ident "$dest" || die "invalid project name: $dest"
+    [ "$dest" != "$PROJECT" ] || die "'$dest' is this project"
+    local dinst; dinst="$(inst_for "$dest")"
+    limactl list -q 2>/dev/null | grep -qx "$dinst" || die "no VM for '$dest' ($dinst) — create it first: sandbox $dest up"
+    session_export "$what" - | ( PROJECT="$dest"; INST="$dinst"; session_import - )
 }
 
 # ---------------------------------------------------------------- migrate
@@ -1356,7 +1441,9 @@ case "$CMD" in
             ls|list) [ $# -eq 0 ] || die "usage: sandbox $PROJECT session ls"
                      ensure_up; session_ls ;;
             copy|cp) session_copy "$@" ;;
-            *) die "usage: sandbox $PROJECT session [ls] | session copy <session-id|--all> <other-project>" ;;
+            export)  session_export "$@" ;;
+            import)  session_import "$@" ;;
+            *) die "usage: sandbox $PROJECT session [ls] | copy <session-id|--all> <other-project> | export <session-id|--all> [file|-] | import <file|->" ;;
         esac ;;
     shell)    ensure_up; vm_login ;;
     code)     ensure_up

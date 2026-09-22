@@ -50,6 +50,8 @@ sandbox <project> rename <new>       # rename the project (config, VM, Keychain 
 sandbox <project> migrate            # rename an old claude-<project> VM to ai-sandbox-<project>
 sandbox <project> session            # list the Claude sessions in the VM
 sandbox <project> session copy <id|--all> <other-project>  # copy sessions to another VM
+sandbox <project> session export <id|--all> [file|-]       # sessions to a file, for another machine
+sandbox <project> session import <file|->                  # load such an export
 sandbox <project> config [--edit]    # show (or edit) the project's config file
 sandbox <project> audit              # report which GitHub credential the VM holds
 sandbox <project> exec 'go test ./...'
@@ -172,16 +174,40 @@ sandbox acme session copy --all widgets   # every session
 sandbox widgets claude --resume 3f2a…
 ```
 
-The files stream from VM to VM through the host — the transcript plus its
-subagent transcripts, `/rewind` history and todos. Files already in the target
-are left alone, so copying twice is harmless. The target VM has to exist; it is
-started if stopped.
+**To a VM on another machine**, export to a file and import it there:
 
+```sh
+# this Mac
+sandbox acme session export 3f2a          # -> claude-session-acme-3f2a1b2c.tar (--all for everything)
+scp claude-session-acme-3f2a1b2c.tar other-mac:
+# the other Mac
+sandbox widgets session import claude-session-acme-3f2a1b2c.tar
+```
+
+or in one go over ssh (`-` is stdout/stdin; `zsh -l` so the remote finds
+`sandbox` and `limactl` on its PATH):
+
+```sh
+sandbox acme session export 3f2a - | ssh other-mac 'zsh -lc "sandbox widgets session import -"'
+```
+
+`copy` is exactly that pipe, within one machine. What moves is the transcript
+plus its subagent transcripts, `/rewind` history and todos. Files already in the
+target are left alone, so importing twice is harmless. The target VM has to
+exist; it is started if stopped.
+
+- **Different username on the other side is fine.** Session folders are named
+  after the working directory (`/home/igor.linux/workspace` →
+  `-home-igor-linux-workspace`). The export records the source VM's `$HOME` and
+  the import renames the folders to the target's, so `/resume` still finds them.
+- **An import only takes session files.** Anything outside `projects/`,
+  `file-history/` and `todos/`, a `..` path, or a link rejects the whole archive.
 - **Only the conversation moves.** The code it worked on is still in the source
   VM — push it, or copy `~/workspace/<repo>` over. `/resume` lists sessions by
   working directory, so the repo needs the same path in the target VM.
 - **It crosses the project boundary.** A transcript holds every tool output,
-  including any token or file content it showed; you're asked to confirm.
+  including any token or file content it showed; you're asked to confirm, and an
+  export file is written owner-only (`0600`). Delete it once imported.
 - Remote-control sessions copy like any other, but become ordinary sessions in
   the target: the claude.ai session stays with the source VM's daemon.
 
