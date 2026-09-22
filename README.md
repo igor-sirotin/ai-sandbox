@@ -48,6 +48,8 @@ sandbox <project> keys         # (re)create GPG signing key, add to GitHub, veri
 sandbox <project> set-email <email>  # change the git email (regenerates the GPG key)
 sandbox <project> rename <new>       # rename the project (config, VM, Keychain items)
 sandbox <project> migrate            # rename an old claude-<project> VM to ai-sandbox-<project>
+sandbox <project> session            # list the Claude sessions in the VM
+sandbox <project> session copy <id|--all> <other-project>  # copy sessions to another VM
 sandbox <project> config [--edit]    # show (or edit) the project's config file
 sandbox <project> audit              # report which GitHub credential the VM holds
 sandbox <project> exec 'go test ./...'
@@ -157,6 +159,31 @@ per-VM, so projects don't share agent credentials any more than they share token
 
 > Browser-based sign-in in a headless VM prints a URL — open it on the host and
 > paste the code back. API-key auth avoids the round trip.
+
+### Moving Claude sessions between VMs
+
+Each VM keeps its own Claude conversations (`~/.claude/projects/`), so `/resume`
+only sees the ones started in that VM. To carry one over:
+
+```sh
+sandbox acme session                      # list: id, last used, directory, first prompt
+sandbox acme session copy 3f2a widgets    # one session (id or a unique prefix of it)
+sandbox acme session copy --all widgets   # every session
+sandbox widgets claude --resume 3f2a…
+```
+
+The files stream from VM to VM through the host — the transcript plus its
+subagent transcripts, `/rewind` history and todos. Files already in the target
+are left alone, so copying twice is harmless. The target VM has to exist; it is
+started if stopped.
+
+- **Only the conversation moves.** The code it worked on is still in the source
+  VM — push it, or copy `~/workspace/<repo>` over. `/resume` lists sessions by
+  working directory, so the repo needs the same path in the target VM.
+- **It crosses the project boundary.** A transcript holds every tool output,
+  including any token or file content it showed; you're asked to confirm.
+- Remote-control sessions copy like any other, but become ordinary sessions in
+  the target: the claude.ai session stays with the source VM's daemon.
 
 ### Background daemons — remote control
 
