@@ -25,6 +25,9 @@
 #   sandbox <project> set-email <email>  change the git email (regenerates GPG signing key)
 #   sandbox <project> rename <new>   rename the project: config, VM and Keychain items
 #   sandbox <project> migrate        rename a legacy claude-<project> VM to ai-sandbox-<project>
+#   sandbox <project> session [ls]   list the Claude sessions in the VM
+#   sandbox <project> session copy <id|--all> <other-project>
+#                                    copy Claude sessions into another project's VM
 #   sandbox <project> config [--edit]    show (or edit) the project's config file
 #   sandbox <project> audit          report which GitHub credential the VM holds
 #   sandbox <project> exec CMD...    run a command in the VM
@@ -57,7 +60,7 @@ DEFAULT_AGENT="claude"
 
 # Commands are matched before the agent registry, so these names can never
 # resolve to an agent; `sandbox agents` warns if one is shadowed.
-BUILTIN_CMDS="up start auth keys set-email email rename mv migrate shell code exec stop destroy delete status agent daemon daemons config conf audit secret token"
+BUILTIN_CMDS="up start auth keys set-email email rename mv migrate session sessions shell code exec stop destroy delete status agent daemon daemons config conf audit secret token"
 
 die() { echo "sandbox: $*" >&2; exit 1; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
@@ -1130,6 +1133,110 @@ rename_project() { # $1 = the new name for $PROJECT
     echo ">> '$old' is now '$new'.  Run:  sandbox $new"
 }
 
+# ---------------------------------------------------------------- sessions
+# Claude Code keeps each conversation in the VM as
+# ~/.claude/projects/<cwd, '/' -> '-'>/<id>.jsonl, plus optional <id>/
+# (subagent transcripts), file-history/<id> (/rewind) and todos/<id>-*.json.
+# Nothing is shared between VMs, so moving a session means streaming those
+# files from one VM to the other through the host. The in-VM scripts run under
+# plain `bash -c`, not a login shell, so nothing a profile prints can end up
+# inside the tar stream; values reach them through env, never the command line.
+
+session_ls() {
+    echo "Claude sessions in $INST, newest first:"
+    vm python3 - <<'PY'
+import glob, json, os, time
+root = os.path.expanduser("~/.claude/projects")
+if not os.path.isdir(root):
+    print("  (no Claude sessions in this VM)"); raise SystemExit
+os.chdir(root)
+def first_prompt(path):
+    try:
+        with open(path) as f:
+            for line in f:
+                try: e = json.loads(line)
+                except ValueError: continue
+                if e.get("type") != "user": continue
+                c = (e.get("message") or {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+                if isinstance(c, str) and c.strip() and not c.lstrip().startswith("<"):
+                    return " ".join(c.split())[:60]
+    except OSError: pass
+    return ""
+files = sorted(glob.glob("*/*.jsonl"), key=os.path.getmtime, reverse=True)
+if not files: print("  (no Claude sessions in this VM)")
+for f in files:
+    d, name = f.split("/", 1)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(f)))
+    print(f"  {name[:-6]}  {when}  {d}\n      {first_prompt(f)}")
+PY
+}
+
+session_copy() { # <id|id-prefix|--all> <dest-project>
+    local what="${1:-}" dest="${2:-}" all=0
+    [ $# -eq 2 ] && [ -n "$what" ] && [ -n "$dest" ] \
+        || die "usage: sandbox $PROJECT session copy <session-id|--all> <other-project>"
+    if [ "$what" = "--all" ]; then all=1
+    else [[ "$what" =~ ^[0-9a-f-]{4,36}$ ]] || die "not a session id: '$what' (see: sandbox $PROJECT session ls)"
+    fi
+    valid_ident "$dest" || die "invalid project name: $dest"
+    [ "$dest" != "$PROJECT" ] || die "'$dest' is this project"
+    local dinst; dinst="$(inst_for "$dest")"
+    limactl list -q 2>/dev/null | grep -qx "$dinst" || die "no VM for '$dest' ($dinst) — create it first: sandbox $dest up"
+
+    ensure_up
+    # What to send, resolved in the source VM: paths relative to ~/.claude.
+    local list
+    list="$(vm env ALL="$all" ID="$what" bash -c '
+        cd ~/.claude 2>/dev/null || exit 0
+        shopt -s nullglob
+        if [ "$ALL" = 1 ]; then
+            for p in projects file-history todos; do [ -e "$p" ] && echo "$p"; done
+            exit 0
+        fi
+        m=(projects/*/"$ID"*.jsonl)
+        [ ${#m[@]} -eq 1 ] || { echo "!${#m[@]}"; exit 0; }
+        f="${m[0]}"; id="$(basename "$f" .jsonl)"
+        echo "$f"
+        for p in "${f%.jsonl}" "file-history/$id" todos/"$id"-*; do [ -e "$p" ] && echo "$p"; done
+        exit 0')" || die "could not read sessions in $INST"
+    case "$list" in
+        "")   die "no Claude sessions in $INST" ;;
+        "!0") die "no session '$what' in $INST (see: sandbox $PROJECT session ls)" ;;
+        "!"*) die "'$what' matches ${list#!} sessions in $INST — give more of the id" ;;
+    esac
+
+    local id="" n
+    if [ "$all" = 1 ]; then
+        n="$(vm bash -c 'ls ~/.claude/projects/*/*.jsonl 2>/dev/null | wc -l' | tr -d ' ')"
+        echo ">> $INST -> $dinst: all $n Claude session(s)"
+    else
+        id="$(basename "$(printf '%s\n' "$list" | head -1)" .jsonl)"
+        echo ">> $INST -> $dinst: session $id"
+    fi
+    # The VM is a project boundary; a transcript is everything that crossed it.
+    echo "   A transcript holds every tool output, including any token or file it showed —"
+    echo "   copying it gives '$dest' what '$PROJECT' saw."
+    confirm "Copy?" "Y" || die "aborted — nothing was copied"
+
+    ( PROJECT="$dest"; INST="$dinst"; ensure_up ) || die "could not start $dinst"
+    # Same HOME in both VMs means the same encoded directory, so /resume finds it.
+    local shome dhome
+    shome="$(vm printenv HOME)"; dhome="$(limactl shell "$dinst" printenv HOME)"
+    vm env LIST="$list" bash -c 'cd ~/.claude && printf "%s\n" "$LIST" | tar -cf - -T -' \
+        | limactl shell "$dinst" bash -c 'mkdir -p ~/.claude && tar -C ~/.claude -xf - --skip-old-files' \
+        || die "copy failed"
+    echo ">> copied (anything already in $dinst was left as it is)"
+    [ "$shome" = "$dhome" ] || echo "   !! HOME differs ($shome vs $dhome): /resume in '$dest' looks under a different directory name"
+    if [ -n "$id" ]; then
+        echo "   resume it with:  sandbox $dest claude --resume $id"
+    else
+        echo "   pick one with:   sandbox $dest claude --resume"
+    fi
+    echo "   (only the conversation moved — the code it worked on is still in $INST)"
+}
+
 # ---------------------------------------------------------------- migrate
 # claude-<project> -> ai-sandbox-<project>. Only the VM's name changes: the
 # config, Keychain items and everything inside the VM stay as they are.
@@ -1243,6 +1350,14 @@ case "$CMD" in
     migrate)
         [ $# -eq 0 ] || die "usage: sandbox $PROJECT migrate"
         migrate_project ;;
+    session|sessions)
+        sub="${1:-ls}"; shift || true
+        case "$sub" in
+            ls|list) [ $# -eq 0 ] || die "usage: sandbox $PROJECT session ls"
+                     ensure_up; session_ls ;;
+            copy|cp) session_copy "$@" ;;
+            *) die "usage: sandbox $PROJECT session [ls] | session copy <session-id|--all> <other-project>" ;;
+        esac ;;
     shell)    ensure_up; vm_login ;;
     code)     ensure_up
               command -v code >/dev/null 2>&1 || die "VS Code 'code' CLI not on PATH (install it / enable 'code' command)"
