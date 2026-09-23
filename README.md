@@ -139,7 +139,9 @@ Set the agent a bare `sandbox <project>` opens with `use_agent` in the project
 config (or `sandbox <project> agent default <name>`); absent, it's `claude`.
 
 Arguments pass straight through — `sandbox acme opencode run "..."`,
-`sandbox acme claude --resume`.
+`sandbox acme claude --model opus`. For Claude they go to `claude agents` (the
+agent view), so flags of the plain `claude` CLI such as `--resume` don't apply;
+run those from `sandbox <project> shell` in `~/workspace`.
 
 > Built-in commands are matched before agent names, so an agent can never shadow
 > `shell`, `status`, etc. If one is named after a command, reach it with
@@ -171,8 +173,13 @@ only sees the ones started in that VM. To carry one over:
 sandbox acme session                      # list: id, last used, directory, first prompt
 sandbox acme session copy 3f2a widgets    # one session (id or a unique prefix of it)
 sandbox acme session copy --all widgets   # every session
-sandbox widgets claude --resume 3f2a…
+
+sandbox widgets shell                     # then, in the VM:
+cd ~/workspace && claude --dangerously-skip-permissions --resume 3f2a…
 ```
+
+(`sandbox widgets claude` opens `claude agents`, which has no `--resume`; and a
+session is only found from the directory it was started in — `~/workspace`.)
 
 **To a VM on another machine**, export to a file and import it there:
 

@@ -1305,8 +1305,11 @@ session_import() { # <file|->
     rm -f "$tmp"
     n="$(printf '%s' "$ids" | grep -c . || true)"
     echo ">> imported $n session(s) into $INST (anything already there was left as it is)"
-    if [ "$n" = 1 ]; then echo "   resume it with:  sandbox $PROJECT claude --resume $ids"
-    else echo "   pick one with:   sandbox $PROJECT claude --resume"; fi
+    # `sandbox <project> claude` opens `claude agents`, which has no --resume:
+    # resuming goes through a shell, from the directory the session was filed under.
+    local one=""; [ "$n" != 1 ] || one=" $ids"
+    echo "   resume it:  sandbox $PROJECT shell"
+    echo "               cd ~/workspace && claude --dangerously-skip-permissions --resume$one"
     echo "   (only the conversation moved — the code it worked on is not part of it)"
 }
 
