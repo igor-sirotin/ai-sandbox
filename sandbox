@@ -30,8 +30,10 @@
 #                                    copy Claude sessions into another project's VM
 #   sandbox <project> session export <id|--all> [file|-]
 #                                    write Claude sessions to a file (or stdout)
-#   sandbox <project> session import <file|->
+#   sandbox <project> session import <file|-> [--no-register]
 #                                    load an export, e.g. one made on another machine
+#   sandbox <project> session register <id...|--all> [--running]
+#                                    list sessions in the agent view (`claude agents`)
 #   sandbox <project> config [--edit]    show (or edit) the project's config file
 #   sandbox <project> audit          report which GitHub credential the VM holds
 #   sandbox <project> exec CMD...    run a command in the VM
@@ -1251,9 +1253,16 @@ session_export() { # <id|--all> [file|-]
 
 # Only session files are accepted — nothing outside projects/, file-history/
 # and todos/, no '..', no links — and nothing already in the VM is overwritten.
-session_import() { # <file|->
-    local in="${1:-}"
-    [ $# -eq 1 ] && [ -n "$in" ] || die "usage: sandbox $PROJECT session import <file|->"
+session_import() { # <file|-> [--no-register]
+    local in="" register=1 a
+    for a in "$@"; do
+        case "$a" in
+            --no-register) register=0 ;;
+            *) [ -z "$in" ] || die "usage: sandbox $PROJECT session import <file|-> [--no-register]"
+               in="$a" ;;
+        esac
+    done
+    [ -n "$in" ] || die "usage: sandbox $PROJECT session import <file|-> [--no-register]"
     exists || die "no VM '$INST' — create it first: sandbox $PROJECT up"
     local src="$in" tmp=""
     if [ "$in" = "-" ]; then
@@ -1305,12 +1314,114 @@ session_import() { # <file|->
     rm -f "$tmp"
     n="$(printf '%s' "$ids" | grep -c . || true)"
     echo ">> imported $n session(s) into $INST (anything already there was left as it is)"
-    # `sandbox <project> claude` opens `claude agents`, which has no --resume:
-    # resuming goes through a shell, from the directory the session was filed under.
-    local one=""; [ "$n" != 1 ] || one=" $ids"
-    echo "   resume it:  sandbox $PROJECT shell"
-    echo "               cd ~/workspace && claude --dangerously-skip-permissions --resume$one"
     echo "   (only the conversation moved — the code it worked on is not part of it)"
+    [ "$n" -gt 0 ] || return 0
+    if [ "$register" = 1 ]; then
+        # shellcheck disable=SC2086  # one id per word, by construction
+        session_register $ids
+    else
+        echo "   to list them in the agent view:  sandbox $PROJECT session register --all"
+    fi
+}
+
+# The agent view (`claude agents`) lists the background-session daemon's jobs,
+# not transcripts, so an imported conversation only shows up there once it is
+# resumed in the background — by hand: `claude --resume`, pick it, press ←.
+# `claude --bg --resume <id>` does the same in one step and sends nothing to the
+# model. Each session is started from the directory it was recorded in (its home
+# prefix re-mapped to this VM's), then stopped again unless --running: an idle
+# background session holds a few hundred MB, and a whole export's worth would
+# not fit in the VM. Sessions already in the agent view are left alone.
+session_register() { # <session-id...|--all> [--running]
+    local running=0 ids=() a
+    for a in "$@"; do
+        case "$a" in
+            --running) running=1 ;;
+            --all)     ids+=(--all) ;;
+            *) [[ "$a" =~ ^[0-9a-f-]{4,36}$ ]] || die "not a session id: '$a' (see: sandbox $PROJECT session ls)"
+               ids+=("$a") ;;
+        esac
+    done
+    [ ${#ids[@]} -gt 0 ] || die "usage: sandbox $PROJECT session register <session-id...|--all> [--running]"
+    ensure_up
+    echo ">> adding sessions to the agent view in $INST (one background start each — takes a moment)"
+    if [ "$running" = 1 ]; then
+        echo "   leaving them running idle: each holds a few hundred MB until stopped (claude stop <id>)"
+    fi
+    vm env IDS="${ids[*]}" RUNNING="$running" PROJECT="$PROJECT" python3 - <<'PY' || die "some sessions could not be added — see above"
+import glob, json, os, re, shutil, subprocess, sys
+home = os.path.expanduser("~")
+want = os.environ.get("IDS", "").split()
+running = os.environ.get("RUNNING") == "1"
+claude = shutil.which("claude", path=os.path.join(home, ".local/bin") + os.pathsep + os.environ.get("PATH", ""))
+if not claude:
+    print("   !! Claude Code is not installed in this VM (sandbox <project> agent install claude)"); sys.exit(1)
+ansi = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+def run(args, cwd=None):
+    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=180)
+    return r.returncode, ansi.sub("", r.stdout), ansi.sub("", r.stderr)
+def last_line(*texts):
+    lines = [l.strip() for t in texts for l in t.splitlines() if l.strip()]
+    return lines[-1] if lines else "no output"
+
+rc, out, err = run([claude, "agents", "--json", "--all"])
+try:
+    known = {a.get("sessionId") for a in json.loads(out)}
+except ValueError:
+    print("   !! could not read the agent view (claude agents --json): " + last_line(out, err)); sys.exit(1)
+
+files = {os.path.basename(f)[:-len(".jsonl")]: f for f in glob.glob(os.path.join(home, ".claude/projects/*/*.jsonl"))}
+bad = 0
+if "--all" in want:
+    ids = sorted(files, key=lambda i: os.path.getmtime(files[i]))   # oldest first: newest ends on top
+else:
+    ids = []
+    for w in want:
+        m = [i for i in files if i.startswith(w)]
+        if len(m) == 1: ids.append(m[0])
+        else: print(f"   !! {w}: " + ("no such session" if not m else f"matches {len(m)} sessions — give more of the id")); bad += 1
+
+def recorded_cwd(path):
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try: c = json.loads(line).get("cwd")
+            except (ValueError, AttributeError): continue
+            if isinstance(c, str) and c: return c
+    return None
+
+added = skipped = 0
+for sid in ids:
+    if sid in known:
+        print(f"   = {sid[:8]}  already in the agent view"); skipped += 1; continue
+    cwd = recorded_cwd(files[sid])
+    if not cwd:
+        print(f"   - {sid[:8]}  no working directory recorded (an empty session?)"); skipped += 1; continue
+    if not os.path.isdir(cwd):
+        # Exported from a VM with another $HOME: same path under this one.
+        m = re.match(r"^/(home|Users)/[^/]+", cwd)
+        alt = home + cwd[m.end():] if m else None
+        if alt and os.path.isdir(alt):
+            cwd = alt
+        else:
+            print(f"   - {sid[:8]}  {alt or cwd} does not exist here — create it (clone the repo, re-add the worktree) and re-run")
+            skipped += 1; continue
+    rc, out, err = run([claude, "--bg", "--resume", sid, "--dangerously-skip-permissions"], cwd=cwd)
+    if rc != 0:
+        print(f"   !! {sid[:8]}  {last_line(out, err)}"); bad += 1; continue
+    m = re.search(r"backgrounded\W+([0-9a-f]{6,})", out + err)
+    job = m.group(1) if m else sid[:8]
+    # A background job is named after the first 8 characters of its session id;
+    # if one by that name exists, Claude starts a copy under a new id.
+    note = f"  (as a copy, {job}: another job already uses {sid[:8]})" if "a copy" in out + err else ""
+    note += "  (running)" if running else ""
+    if not running:
+        rc, out, err = run([claude, "stop", job])
+        if rc != 0: note += f"  (added, but still running: {last_line(out, err)})"
+    print(f"   + {sid[:8]}  {cwd}{note}"); added += 1
+print(f">> {added} added to the agent view, {skipped} skipped" + (f", {bad} failed" if bad else ""))
+if added: print(f">> open them from the agent view:  sandbox {os.environ.get('PROJECT', '<project>')}")
+sys.exit(1 if bad else 0)
+PY
 }
 
 # Same machine: export straight into the other project's import.
@@ -1446,7 +1557,8 @@ case "$CMD" in
             copy|cp) session_copy "$@" ;;
             export)  session_export "$@" ;;
             import)  session_import "$@" ;;
-            *) die "usage: sandbox $PROJECT session [ls] | copy <session-id|--all> <other-project> | export <session-id|--all> [file|-] | import <file|->" ;;
+            register) session_register "$@" ;;
+            *) die "usage: sandbox $PROJECT session [ls] | copy <session-id|--all> <other-project> | export <session-id|--all> [file|-] | import <file|-> [--no-register] | register <session-id...|--all> [--running]" ;;
         esac ;;
     shell)    ensure_up; vm_login ;;
     code)     ensure_up

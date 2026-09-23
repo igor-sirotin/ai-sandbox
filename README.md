@@ -51,7 +51,8 @@ sandbox <project> migrate            # rename an old claude-<project> VM to ai-s
 sandbox <project> session            # list the Claude sessions in the VM
 sandbox <project> session copy <id|--all> <other-project>  # copy sessions to another VM
 sandbox <project> session export <id|--all> [file|-]       # sessions to a file, for another machine
-sandbox <project> session import <file|->                  # load such an export
+sandbox <project> session import <file|-> [--no-register] # load such an export
+sandbox <project> session register <id...|--all> [--running]  # show sessions in the agent view
 sandbox <project> config [--edit]    # show (or edit) the project's config file
 sandbox <project> audit              # report which GitHub credential the VM holds
 sandbox <project> exec 'go test ./...'
@@ -173,13 +174,11 @@ only sees the ones started in that VM. To carry one over:
 sandbox acme session                      # list: id, last used, directory, first prompt
 sandbox acme session copy 3f2a widgets    # one session (id or a unique prefix of it)
 sandbox acme session copy --all widgets   # every session
-
-sandbox widgets shell                     # then, in the VM:
-cd ~/workspace && claude --dangerously-skip-permissions --resume 3f2a…
+sandbox widgets                           # they're in the agent view
 ```
 
-(`sandbox widgets claude` opens `claude agents`, which has no `--resume`; and a
-session is only found from the directory it was started in — `~/workspace`.)
+Copied sessions land in the agent view (`claude agents`, what `sandbox <project>`
+opens) — see [below](#showing-sessions-in-the-agent-view).
 
 **To a VM on another machine**, export to a file and import it there:
 
@@ -217,6 +216,32 @@ exist; it is started if stopped.
   export file is written owner-only (`0600`). Delete it once imported.
 - Remote-control sessions copy like any other, but become ordinary sessions in
   the target: the claude.ai session stays with the source VM's daemon.
+
+#### Showing sessions in the agent view
+
+The agent view lists the background-session daemon's jobs, not transcripts, so
+a transcript that was only copied in doesn't show there. By hand you'd fix that
+with `claude --resume`, opening the session and pressing `←`; `import` (and so
+`copy`) does the same for every session it brings in, via
+`claude --bg --resume <id>` — which sends nothing to the model — and then stops
+it again, so 100 imported sessions aren't 100 idle processes (a few hundred MB
+each). To do it for sessions already in the VM, or after `--no-register`:
+
+```sh
+sandbox widgets session register --all               # every session not in the agent view yet
+sandbox widgets session register 3f2a 91bc           # just these
+sandbox widgets session register 3f2a --running      # and leave it running idle, like ←
+```
+
+Each session is started in the directory it was recorded in — `~/workspace`, a
+repo under it, a worktree — with the home directory mapped to this VM's. When
+that directory doesn't exist here the session is skipped and named: clone the
+repo or re-create the worktree at that path, then run `register` again.
+Sessions already in the agent view are left alone, so re-running is safe.
+
+To resume one without the agent view: `sandbox widgets shell`, then
+`cd <its directory> && claude --dangerously-skip-permissions --resume <id>` —
+`sandbox widgets claude --resume` doesn't work, as that opens `claude agents`.
 
 ### Background daemons — remote control
 
