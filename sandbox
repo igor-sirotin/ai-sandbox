@@ -25,6 +25,15 @@
 #   sandbox <project> set-email <email>  change the git email (regenerates GPG signing key)
 #   sandbox <project> rename <new>   rename the project: config, VM and Keychain items
 #   sandbox <project> migrate        rename a legacy claude-<project> VM to ai-sandbox-<project>
+#   sandbox <project> session [ls]   list the Claude sessions in the VM
+#   sandbox <project> session copy <id|--all> <other-project>
+#                                    copy Claude sessions into another project's VM
+#   sandbox <project> session export <id|--all> [file|-]
+#                                    write Claude sessions to a file (or stdout)
+#   sandbox <project> session import <file|-> [--no-register]
+#                                    load an export, e.g. one made on another machine
+#   sandbox <project> session register <id...|--all> [--running]
+#                                    list sessions in the agent view (`claude agents`)
 #   sandbox <project> config [--edit]    show (or edit) the project's config file
 #   sandbox <project> audit          report which GitHub credential the VM holds
 #   sandbox <project> exec CMD...    run a command in the VM
@@ -57,7 +66,7 @@ DEFAULT_AGENT="claude"
 
 # Commands are matched before the agent registry, so these names can never
 # resolve to an agent; `sandbox agents` warns if one is shadowed.
-BUILTIN_CMDS="up start auth keys set-email email rename mv migrate shell code exec stop destroy delete status agent daemon daemons config conf audit secret token"
+BUILTIN_CMDS="up start auth keys set-email email rename mv migrate session sessions shell code exec stop destroy delete status agent daemon daemons config conf audit secret token"
 
 die() { echo "sandbox: $*" >&2; exit 1; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
@@ -1130,6 +1139,303 @@ rename_project() { # $1 = the new name for $PROJECT
     echo ">> '$old' is now '$new'.  Run:  sandbox $new"
 }
 
+# ---------------------------------------------------------------- sessions
+# Claude Code keeps each conversation in the VM as
+# ~/.claude/projects/<cwd, '/' -> '-'>/<id>.jsonl, plus optional <id>/
+# (subagent transcripts), file-history/<id> (/rewind) and todos/<id>-*.json.
+# Nothing is shared between VMs, so moving a session means streaming those
+# files from one VM to the other through the host. The in-VM scripts run under
+# plain `bash -c`, not a login shell, so nothing a profile prints can end up
+# inside the tar stream; values reach them through env, never the command line.
+
+session_ls() {
+    echo "Claude sessions in $INST, newest first:"
+    vm python3 - <<'PY'
+import glob, json, os, time
+root = os.path.expanduser("~/.claude/projects")
+if not os.path.isdir(root):
+    print("  (no Claude sessions in this VM)"); raise SystemExit
+os.chdir(root)
+def first_prompt(path):
+    try:
+        with open(path) as f:
+            for line in f:
+                try: e = json.loads(line)
+                except ValueError: continue
+                if e.get("type") != "user": continue
+                c = (e.get("message") or {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+                if isinstance(c, str) and c.strip() and not c.lstrip().startswith("<"):
+                    return " ".join(c.split())[:60]
+    except OSError: pass
+    return ""
+files = sorted(glob.glob("*/*.jsonl"), key=os.path.getmtime, reverse=True)
+if not files: print("  (no Claude sessions in this VM)")
+for f in files:
+    d, name = f.split("/", 1)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(f)))
+    print(f"  {name[:-6]}  {when}  {d}\n      {first_prompt(f)}")
+PY
+}
+
+# Resolve <id|id-prefix|--all> in this VM: _S_PATHS gets the paths (relative to
+# ~/.claude) that make it up, one per line; _S_ID the full id (empty for --all).
+session_paths() {
+    local what="$1" all=0 list
+    if [ "$what" = "--all" ]; then all=1
+    else [[ "$what" =~ ^[0-9a-f-]{4,36}$ ]] || die "not a session id: '$what' (see: sandbox $PROJECT session ls)"
+    fi
+    list="$(vm env ALL="$all" ID="$what" bash -c '
+        cd ~/.claude 2>/dev/null || exit 0
+        shopt -s nullglob
+        if [ "$ALL" = 1 ]; then
+            for p in projects file-history todos; do [ -e "$p" ] && echo "$p"; done
+            exit 0
+        fi
+        m=(projects/*/"$ID"*.jsonl)
+        [ ${#m[@]} -eq 1 ] || { echo "!${#m[@]}"; exit 0; }
+        f="${m[0]}"; id="$(basename "$f" .jsonl)"
+        echo "$f"
+        for p in "${f%.jsonl}" "file-history/$id" todos/"$id"-*; do [ -e "$p" ] && echo "$p"; done
+        exit 0')" || die "could not read sessions in $INST"
+    case "$list" in
+        "")   die "no Claude sessions in $INST" ;;
+        "!0") die "no session '$what' in $INST (see: sandbox $PROJECT session ls)" ;;
+        "!"*) die "'$what' matches ${list#!} sessions in $INST — give more of the id" ;;
+    esac
+    _S_PATHS="$list"; _S_ID=""
+    [ "$all" = 1 ] || _S_ID="$(basename "$(printf '%s\n' "$list" | head -1)" .jsonl)"
+}
+
+# An export is a plain tar of those paths, plus sandbox-export.txt recording the
+# source VM's $HOME: session folders are named after the working directory, so
+# an import into a VM with a different HOME (another Mac, another username)
+# renames them to match. Everything but the tar itself goes to stderr, so
+# `export ... -` can feed a pipe.
+session_export() { # <id|--all> [file|-]
+    local what="${1:-}" out="${2:-}"
+    [ $# -ge 1 ] && [ $# -le 2 ] && [ -n "$what" ] \
+        || die "usage: sandbox $PROJECT session export <session-id|--all> [file|-]"
+    ensure_up >&2
+    session_paths "$what"
+    if [ -z "$out" ]; then
+        if [ -n "$_S_ID" ]; then out="claude-session-$PROJECT-${_S_ID:0:8}.tar"
+        else out="claude-sessions-$PROJECT.tar"; fi
+    fi
+    if [ "$out" = "-" ]; then
+        [ ! -t 1 ] || die "refusing to write a tar archive to the terminal — pipe it, or give a file name"
+    else
+        [ ! -e "$out" ] || die "$out already exists"
+    fi
+    {
+        if [ -n "$_S_ID" ]; then echo ">> exporting session $_S_ID from $INST"
+        else echo ">> exporting all $(printf '%s\n' "$_S_PATHS" | wc -l | tr -d ' ') session folder(s) from $INST"; fi
+        # The VM is a project boundary; a transcript is everything that crossed it.
+        echo "   A transcript holds every tool output, including any token or file it showed —"
+        echo "   whoever imports it sees what '$PROJECT' saw."
+    } >&2
+    confirm "Continue?" "Y" || die "aborted — nothing was exported"
+
+    local stream='t="$(mktemp -d)"; trap "rm -rf \"$t\"" EXIT
+        printf "home=%s\n" "$HOME" > "$t/sandbox-export.txt"
+        printf "%s\n" "$LIST" | tar -cf - -C "$t" sandbox-export.txt -C "$HOME/.claude" -T -'
+    if [ "$out" = "-" ]; then
+        vm env LIST="$_S_PATHS" bash -c "$stream" || die "export failed"
+    else
+        # Transcripts can hold secrets: owner-only, and never a half-written file.
+        ( umask 077; vm env LIST="$_S_PATHS" bash -c "$stream" > "$out.part" ) \
+            || { rm -f "$out.part"; die "export failed"; }
+        mv "$out.part" "$out"
+        echo ">> wrote $out — on the other machine:  sandbox <project> session import $out" >&2
+    fi
+}
+
+# Only session files are accepted — nothing outside projects/, file-history/
+# and todos/, no '..', no links — and nothing already in the VM is overwritten.
+session_import() { # <file|-> [--no-register]
+    local in="" register=1 a
+    for a in "$@"; do
+        case "$a" in
+            --no-register) register=0 ;;
+            *) [ -z "$in" ] || die "usage: sandbox $PROJECT session import <file|-> [--no-register]"
+               in="$a" ;;
+        esac
+    done
+    [ -n "$in" ] || die "usage: sandbox $PROJECT session import <file|-> [--no-register]"
+    exists || die "no VM '$INST' — create it first: sandbox $PROJECT up"
+    local src="$in" tmp=""
+    if [ "$in" = "-" ]; then
+        [ ! -t 0 ] || die "stdin is a terminal — pipe an export in, or give a file name"
+        tmp="$(mktemp)"; src="$tmp"
+        cat > "$tmp" || { rm -f "$tmp"; die "could not read stdin"; }
+    else
+        [ -f "$in" ] || die "no such file: $in"
+    fi
+    [ -s "$src" ] || { rm -f "$tmp"; die "nothing to import (empty input)"; }
+    local names types n bad=""
+    names="$(tar -tf "$src" 2>/dev/null)" || { rm -f "$tmp"; die "not a tar archive: $in"; }
+    while IFS= read -r n; do
+        case "$n" in
+            sandbox-export.txt|projects|projects/*|file-history|file-history/*|todos|todos/*) ;;
+            *) bad="unexpected path '$n'"; break ;;
+        esac
+        case "/$n/" in */../*) bad="'..' in '$n'"; break ;; esac
+    done <<<"$names"
+    # ls-style listing: first column is the type — only files and directories.
+    types="$(tar -tvf "$src" | cut -c1 | sort -u | tr -d '\n')"
+    case "$types" in *[!-d]*) [ -n "$bad" ] || bad="links or special files" ;; esac
+    [ -z "$bad" ] || { rm -f "$tmp"; die "not a session export ($bad) — nothing imported"; }
+
+    ensure_up
+    local ids
+    ids="$(vm bash -c '
+        set -e
+        s="$(mktemp -d)"; trap "rm -rf \"$s\"" EXIT
+        tar -C "$s" -xf - --no-same-owner
+        src="$(sed -n "s/^home=//p" "$s/sandbox-export.txt" 2>/dev/null || true)"
+        rm -f "$s/sandbox-export.txt"
+        enc() { printf "%s" "$1" | sed "s/[^A-Za-z0-9]/-/g"; }
+        if [ -n "$src" ] && [ "$src" != "$HOME" ] && [ -d "$s/projects" ]; then
+            from="$(enc "$src")"; to="$(enc "$HOME")"
+            for d in "$s/projects/"*; do
+                b="${d##*/}"
+                case "$b" in "$from"|"$from"-*) ;; *) continue ;; esac
+                nb="$to${b#"$from"}"
+                if [ -e "$s/projects/$nb" ]; then echo "   !! $b and $nb both present — left $b as is" >&2; continue; fi
+                mv "$d" "$s/projects/$nb"
+                echo "   re-homed $b -> $nb ($src -> $HOME)" >&2
+            done
+        fi
+        mkdir -p ~/.claude
+        (cd "$s" && tar -cf - .) | tar -C ~/.claude -xf - --skip-old-files
+        cd "$s" && ls projects/*/*.jsonl 2>/dev/null | sed "s|.*/||; s|\.jsonl$||" || true' < "$src")" \
+        || { rm -f "$tmp"; die "import into $INST failed"; }
+    rm -f "$tmp"
+    n="$(printf '%s' "$ids" | grep -c . || true)"
+    echo ">> imported $n session(s) into $INST (anything already there was left as it is)"
+    echo "   (only the conversation moved — the code it worked on is not part of it)"
+    [ "$n" -gt 0 ] || return 0
+    if [ "$register" = 1 ]; then
+        # shellcheck disable=SC2086  # one id per word, by construction
+        session_register $ids
+    else
+        echo "   to list them in the agent view:  sandbox $PROJECT session register --all"
+    fi
+}
+
+# The agent view (`claude agents`) lists the background-session daemon's jobs,
+# not transcripts, so an imported conversation only shows up there once it is
+# resumed in the background — by hand: `claude --resume`, pick it, press ←.
+# `claude --bg --resume <id>` does the same in one step and sends nothing to the
+# model. Each session is started from the directory it was recorded in (its home
+# prefix re-mapped to this VM's), then stopped again unless --running: an idle
+# background session holds a few hundred MB, and a whole export's worth would
+# not fit in the VM. Sessions already in the agent view are left alone.
+session_register() { # <session-id...|--all> [--running]
+    local running=0 ids=() a
+    for a in "$@"; do
+        case "$a" in
+            --running) running=1 ;;
+            --all)     ids+=(--all) ;;
+            *) [[ "$a" =~ ^[0-9a-f-]{4,36}$ ]] || die "not a session id: '$a' (see: sandbox $PROJECT session ls)"
+               ids+=("$a") ;;
+        esac
+    done
+    [ ${#ids[@]} -gt 0 ] || die "usage: sandbox $PROJECT session register <session-id...|--all> [--running]"
+    ensure_up
+    echo ">> adding sessions to the agent view in $INST (one background start each — takes a moment)"
+    if [ "$running" = 1 ]; then
+        echo "   leaving them running idle: each holds a few hundred MB until stopped (claude stop <id>)"
+    fi
+    vm env IDS="${ids[*]}" RUNNING="$running" PROJECT="$PROJECT" python3 - <<'PY' || die "some sessions could not be added — see above"
+import glob, json, os, re, shutil, subprocess, sys
+home = os.path.expanduser("~")
+want = os.environ.get("IDS", "").split()
+running = os.environ.get("RUNNING") == "1"
+claude = shutil.which("claude", path=os.path.join(home, ".local/bin") + os.pathsep + os.environ.get("PATH", ""))
+if not claude:
+    print("   !! Claude Code is not installed in this VM (sandbox <project> agent install claude)"); sys.exit(1)
+ansi = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+def run(args, cwd=None):
+    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=180)
+    return r.returncode, ansi.sub("", r.stdout), ansi.sub("", r.stderr)
+def last_line(*texts):
+    lines = [l.strip() for t in texts for l in t.splitlines() if l.strip()]
+    return lines[-1] if lines else "no output"
+
+rc, out, err = run([claude, "agents", "--json", "--all"])
+try:
+    known = {a.get("sessionId") for a in json.loads(out)}
+except ValueError:
+    print("   !! could not read the agent view (claude agents --json): " + last_line(out, err)); sys.exit(1)
+
+files = {os.path.basename(f)[:-len(".jsonl")]: f for f in glob.glob(os.path.join(home, ".claude/projects/*/*.jsonl"))}
+bad = 0
+if "--all" in want:
+    ids = sorted(files, key=lambda i: os.path.getmtime(files[i]))   # oldest first: newest ends on top
+else:
+    ids = []
+    for w in want:
+        m = [i for i in files if i.startswith(w)]
+        if len(m) == 1: ids.append(m[0])
+        else: print(f"   !! {w}: " + ("no such session" if not m else f"matches {len(m)} sessions — give more of the id")); bad += 1
+
+def recorded_cwd(path):
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try: c = json.loads(line).get("cwd")
+            except (ValueError, AttributeError): continue
+            if isinstance(c, str) and c: return c
+    return None
+
+added = skipped = 0
+for sid in ids:
+    if sid in known:
+        print(f"   = {sid[:8]}  already in the agent view"); skipped += 1; continue
+    cwd = recorded_cwd(files[sid])
+    if not cwd:
+        print(f"   - {sid[:8]}  no working directory recorded (an empty session?)"); skipped += 1; continue
+    if not os.path.isdir(cwd):
+        # Exported from a VM with another $HOME: same path under this one.
+        m = re.match(r"^/(home|Users)/[^/]+", cwd)
+        alt = home + cwd[m.end():] if m else None
+        if alt and os.path.isdir(alt):
+            cwd = alt
+        else:
+            print(f"   - {sid[:8]}  {alt or cwd} does not exist here — create it (clone the repo, re-add the worktree) and re-run")
+            skipped += 1; continue
+    rc, out, err = run([claude, "--bg", "--resume", sid, "--dangerously-skip-permissions"], cwd=cwd)
+    if rc != 0:
+        print(f"   !! {sid[:8]}  {last_line(out, err)}"); bad += 1; continue
+    m = re.search(r"backgrounded\W+([0-9a-f]{6,})", out + err)
+    job = m.group(1) if m else sid[:8]
+    # A background job is named after the first 8 characters of its session id;
+    # if one by that name exists, Claude starts a copy under a new id.
+    note = f"  (as a copy, {job}: another job already uses {sid[:8]})" if "a copy" in out + err else ""
+    note += "  (running)" if running else ""
+    if not running:
+        rc, out, err = run([claude, "stop", job])
+        if rc != 0: note += f"  (added, but still running: {last_line(out, err)})"
+    print(f"   + {sid[:8]}  {cwd}{note}"); added += 1
+print(f">> {added} added to the agent view, {skipped} skipped" + (f", {bad} failed" if bad else ""))
+if added: print(f">> open them from the agent view:  sandbox {os.environ.get('PROJECT', '<project>')}")
+sys.exit(1 if bad else 0)
+PY
+}
+
+# Same machine: export straight into the other project's import.
+session_copy() { # <id|id-prefix|--all> <dest-project>
+    local what="${1:-}" dest="${2:-}"
+    [ $# -eq 2 ] && [ -n "$what" ] && [ -n "$dest" ] \
+        || die "usage: sandbox $PROJECT session copy <session-id|--all> <other-project>"
+    valid_ident "$dest" || die "invalid project name: $dest"
+    [ "$dest" != "$PROJECT" ] || die "'$dest' is this project"
+    local dinst; dinst="$(inst_for "$dest")"
+    limactl list -q 2>/dev/null | grep -qx "$dinst" || die "no VM for '$dest' ($dinst) — create it first: sandbox $dest up"
+    session_export "$what" - | ( PROJECT="$dest"; INST="$dinst"; session_import - )
+}
+
 # ---------------------------------------------------------------- migrate
 # claude-<project> -> ai-sandbox-<project>. Only the VM's name changes: the
 # config, Keychain items and everything inside the VM stay as they are.
@@ -1243,6 +1549,17 @@ case "$CMD" in
     migrate)
         [ $# -eq 0 ] || die "usage: sandbox $PROJECT migrate"
         migrate_project ;;
+    session|sessions)
+        sub="${1:-ls}"; shift || true
+        case "$sub" in
+            ls|list) [ $# -eq 0 ] || die "usage: sandbox $PROJECT session ls"
+                     ensure_up; session_ls ;;
+            copy|cp) session_copy "$@" ;;
+            export)  session_export "$@" ;;
+            import)  session_import "$@" ;;
+            register) session_register "$@" ;;
+            *) die "usage: sandbox $PROJECT session [ls] | copy <session-id|--all> <other-project> | export <session-id|--all> [file|-] | import <file|-> [--no-register] | register <session-id...|--all> [--running]" ;;
+        esac ;;
     shell)    ensure_up; vm_login ;;
     code)     ensure_up
               command -v code >/dev/null 2>&1 || die "VS Code 'code' CLI not on PATH (install it / enable 'code' command)"

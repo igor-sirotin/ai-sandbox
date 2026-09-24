@@ -48,6 +48,11 @@ sandbox <project> keys         # (re)create GPG signing key, add to GitHub, veri
 sandbox <project> set-email <email>  # change the git email (regenerates the GPG key)
 sandbox <project> rename <new>       # rename the project (config, VM, Keychain items)
 sandbox <project> migrate            # rename an old claude-<project> VM to ai-sandbox-<project>
+sandbox <project> session            # list the Claude sessions in the VM
+sandbox <project> session copy <id|--all> <other-project>  # copy sessions to another VM
+sandbox <project> session export <id|--all> [file|-]       # sessions to a file, for another machine
+sandbox <project> session import <file|-> [--no-register] # load such an export
+sandbox <project> session register <id...|--all> [--running]  # show sessions in the agent view
 sandbox <project> config [--edit]    # show (or edit) the project's config file
 sandbox <project> audit              # report which GitHub credential the VM holds
 sandbox <project> exec 'go test ./...'
@@ -135,7 +140,9 @@ Set the agent a bare `sandbox <project>` opens with `use_agent` in the project
 config (or `sandbox <project> agent default <name>`); absent, it's `claude`.
 
 Arguments pass straight through — `sandbox acme opencode run "..."`,
-`sandbox acme claude --resume`.
+`sandbox acme claude --model opus`. For Claude they go to `claude agents` (the
+agent view), so flags of the plain `claude` CLI such as `--resume` don't apply;
+run those from `sandbox <project> shell` in `~/workspace`.
 
 > Built-in commands are matched before agent names, so an agent can never shadow
 > `shell`, `status`, etc. If one is named after a command, reach it with
@@ -157,6 +164,84 @@ per-VM, so projects don't share agent credentials any more than they share token
 
 > Browser-based sign-in in a headless VM prints a URL — open it on the host and
 > paste the code back. API-key auth avoids the round trip.
+
+### Moving Claude sessions between VMs
+
+Each VM keeps its own Claude conversations (`~/.claude/projects/`), so `/resume`
+only sees the ones started in that VM. To carry one over:
+
+```sh
+sandbox acme session                      # list: id, last used, directory, first prompt
+sandbox acme session copy 3f2a widgets    # one session (id or a unique prefix of it)
+sandbox acme session copy --all widgets   # every session
+sandbox widgets                           # they're in the agent view
+```
+
+Copied sessions land in the agent view (`claude agents`, what `sandbox <project>`
+opens) — see [below](#showing-sessions-in-the-agent-view).
+
+**To a VM on another machine**, export to a file and import it there:
+
+```sh
+# this Mac
+sandbox acme session export 3f2a          # -> claude-session-acme-3f2a1b2c.tar (--all for everything)
+scp claude-session-acme-3f2a1b2c.tar other-mac:
+# the other Mac
+sandbox widgets session import claude-session-acme-3f2a1b2c.tar
+```
+
+or in one go over ssh (`-` is stdout/stdin; `zsh -l` so the remote finds
+`sandbox` and `limactl` on its PATH):
+
+```sh
+sandbox acme session export 3f2a - | ssh other-mac 'zsh -lc "sandbox widgets session import -"'
+```
+
+`copy` is exactly that pipe, within one machine. What moves is the transcript
+plus its subagent transcripts, `/rewind` history and todos. Files already in the
+target are left alone, so importing twice is harmless. The target VM has to
+exist; it is started if stopped.
+
+- **Different username on the other side is fine.** Session folders are named
+  after the working directory (`/home/igor.linux/workspace` →
+  `-home-igor-linux-workspace`). The export records the source VM's `$HOME` and
+  the import renames the folders to the target's, so `/resume` still finds them.
+- **An import only takes session files.** Anything outside `projects/`,
+  `file-history/` and `todos/`, a `..` path, or a link rejects the whole archive.
+- **Only the conversation moves.** The code it worked on is still in the source
+  VM — push it, or copy `~/workspace/<repo>` over. `/resume` lists sessions by
+  working directory, so the repo needs the same path in the target VM.
+- **It crosses the project boundary.** A transcript holds every tool output,
+  including any token or file content it showed; you're asked to confirm, and an
+  export file is written owner-only (`0600`). Delete it once imported.
+- Remote-control sessions copy like any other, but become ordinary sessions in
+  the target: the claude.ai session stays with the source VM's daemon.
+
+#### Showing sessions in the agent view
+
+The agent view lists the background-session daemon's jobs, not transcripts, so
+a transcript that was only copied in doesn't show there. By hand you'd fix that
+with `claude --resume`, opening the session and pressing `←`; `import` (and so
+`copy`) does the same for every session it brings in, via
+`claude --bg --resume <id>` — which sends nothing to the model — and then stops
+it again, so 100 imported sessions aren't 100 idle processes (a few hundred MB
+each). To do it for sessions already in the VM, or after `--no-register`:
+
+```sh
+sandbox widgets session register --all               # every session not in the agent view yet
+sandbox widgets session register 3f2a 91bc           # just these
+sandbox widgets session register 3f2a --running      # and leave it running idle, like ←
+```
+
+Each session is started in the directory it was recorded in — `~/workspace`, a
+repo under it, a worktree — with the home directory mapped to this VM's. When
+that directory doesn't exist here the session is skipped and named: clone the
+repo or re-create the worktree at that path, then run `register` again.
+Sessions already in the agent view are left alone, so re-running is safe.
+
+To resume one without the agent view: `sandbox widgets shell`, then
+`cd <its directory> && claude --dangerously-skip-permissions --resume <id>` —
+`sandbox widgets claude --resume` doesn't work, as that opens `claude agents`.
 
 ### Background daemons — remote control
 
