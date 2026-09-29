@@ -45,6 +45,12 @@ containerd:
   user: false
 
 provision:
+  # Lima gives every boot a new instance-id, so cloud-init would rotate host keys.
+  - mode: system
+    script: |
+      #!/bin/sh
+      printf 'ssh_deletekeys: false\n' > /etc/cloud/cloud.cfg.d/99-keep-ssh-host-keys.cfg
+
   # ---- system toolchains (run as root) ----
   - mode: system
     script: |
