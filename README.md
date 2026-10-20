@@ -518,6 +518,10 @@ as untrusted and the boundary as the thing doing the work.
   from inside), and the host itself via `host.lima.internal`. Lima also forwards
   ports the guest binds onto the host's loopback. If you need the agent kept off
   a network, this tool doesn't do that — put the VM behind a firewall you control.
+- **Egress goes through Apple's vmnet NAT (`vzNAT`)**, not Lima's user-mode
+  network, which stalls once a few TCP dials are left half-open — routine for P2P
+  nodes dialling unreachable peers. Existing VMs are switched on their next start.
+  If a VPN client on the Mac refuses to route vmnet traffic, that's the reason.
 - **Tokens** sit in the macOS **Keychain** on the host and are injected into the
   VM at auth time; they are never passed as command-line arguments. Note that the
   Keychain protects them from *other users and from theft of a powered-off Mac* —

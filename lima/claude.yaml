@@ -30,6 +30,16 @@ cpus: 4
 memory: "8GiB"
 disk: "60GiB"
 
+# Egress through Apple's vmnet NAT instead of Lima's user-mode network. The
+# user-mode stack proxies every guest connection through a host process that
+# only tolerates a handful of half-open TCP dials at once, so P2P software
+# dialling unreachable peers starves everything else (curl times out while
+# SYNs pile up). The user-mode NIC stays as eth0 for host.lima.internal, but
+# Lima gives it a worse route metric, so the default route goes via vzNAT.
+# Existing VMs get this added by the launcher on their next start.
+networks:
+  - vzNAT: true
+
 # Full isolation: nothing from the host filesystem is mounted, ever. The launcher
 # has no subcommand that adds one — move files with scp/rsync over the VM's SSH
 # host, or with git.

@@ -520,6 +520,17 @@ vm_login() {   # exec an interactive session in the VM; args (optional) = remote
     exec limactl shell "$INST" "$@"
 }
 
+# A template edit only reaches new VMs, so give older ones the template's vzNAT
+# network (see lima/claude.yaml for why) the next time they're started. The VM
+# must be stopped for `limactl edit`; a running one switches on its next restart.
+ensure_vznat() {
+    case "$(limactl list "$INST" --format '{{json .Config.Networks}}' 2>/dev/null)" in
+        *'"vzNAT":true'*) return 0 ;;
+    esac
+    echo ">> switching '$INST' to vzNAT networking (one-time)..."
+    limactl edit --tty=false "$INST" --network vzNAT
+}
+
 _VM_COLD=0     # did *this* invocation start the VM?
 ensure_up() {
     _VM_COLD=0
@@ -529,6 +540,7 @@ ensure_up() {
         configure_identities   # auto-apply project auth on first create
         _VM_COLD=1
     elif ! running; then
+        ensure_vznat
         limactl start "$INST"
         _VM_COLD=1
     fi
