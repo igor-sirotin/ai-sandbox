@@ -2,11 +2,11 @@
 # Runs inside the VM (via `sandbox <project> dotfiles`, and on the first start of
 # a VM that has none yet). Installs chezmoi at a pinned, checksummed version and
 # applies the dotfiles repo at DOTFILES_URL to the VM user's home.
-# Env: DOTFILES_URL; MODE=ensure (apply only if no dotfiles are checked out yet)
-#      or MODE=update (also pull and re-apply an existing checkout).
+# Env: DOTFILES_URL; MODE=ensure (apply only if that has not succeeded here yet)
+#      or MODE=update (also pull and re-apply).
 #
 # The repo's own scripts run as the VM user, with sudo and the project's tokens
-# in reach — the same trust as anything else installed in the VM. The clone is
+# on disk — the same trust as anything else installed in the VM. The clone is
 # anonymous: no credential helper is consulted, so the project's token is never
 # offered to the dotfiles host.
 set -euo pipefail
@@ -20,8 +20,9 @@ CHEZMOI_SHA256_amd64="ae01c66b1a6dbf563667c63fbbd9986b3cfa3c98dd266ddee732f63e8a
 
 BIN="$HOME/.local/bin/chezmoi"
 SRC="$HOME/.local/share/chezmoi"
+APPLIED="$HOME/.config/sandbox/dotfiles-applied"
 
-if ! [ -x "$BIN" ] || [ "$("$BIN" --version 2>/dev/null | awk '{print $3}' | tr -d 'v,')" != "$CHEZMOI_VER" ]; then
+if ! [ -x "$BIN" ]; then
     ARCH="$(dpkg --print-architecture)"
     case "$ARCH" in
         arm64) SHA256="$CHEZMOI_SHA256_arm64" ;;
@@ -37,6 +38,7 @@ if ! [ -x "$BIN" ] || [ "$("$BIN" --version 2>/dev/null | awk '{print $3}' | tr 
     install -D -m 0755 "$TMP/chezmoi" "$BIN"
 fi
 
+unset GH_TOKEN GITHUB_TOKEN
 export GIT_TERMINAL_PROMPT=0
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=
 
@@ -47,8 +49,10 @@ if [ -d "$SRC/.git" ]; then
         echo "Remove it inside the VM to switch repos." >&2
         exit 1
     fi
-    [ "$MODE" = update ] || exit 0
-    "$BIN" update </dev/null
+    if [ "$MODE" != update ] && [ -e "$APPLIED" ]; then exit 0; fi
+    "$BIN" update --init </dev/null
 else
     "$BIN" init --apply "$DOTFILES_URL" </dev/null
 fi
+mkdir -p "$(dirname "$APPLIED")"
+: > "$APPLIED"

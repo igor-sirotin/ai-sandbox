@@ -470,7 +470,8 @@ export AI_SANDBOX_DOTFILES=https://github.com/my-user/dotfiles
 A project's `use_dotfiles` wins over the variable, and `use_dotfiles none` opts
 one project out. The repo is applied (`chezmoi init --apply`) the first time a
 VM starts without dotfiles — so existing VMs get it on their next start — and
-left alone after that. To pull and re-apply later:
+left alone after that; a failed first apply is retried on the next start. To
+pull and re-apply later:
 
 ```sh
 sandbox acme dotfiles
@@ -480,15 +481,21 @@ sandbox acme dotfiles
   anonymous: the project's token is not offered to the dotfiles host, so the
   repo has to be public.
 - **chezmoi is pinned and verified** like the toolchains: an exact version,
-  checked against a SHA-256 recorded in `lima/setup-dotfiles.sh`.
+  checked against a SHA-256 recorded in `lima/setup-dotfiles.sh`. It is only
+  installed when the VM has none, so a newer one you install there is kept.
+- **Keep `~/.gitconfig` out of the dotfiles**, or expect to re-run `sandbox
+  <project> auth` and `keys` after each apply: that file holds the VM's git
+  identity, credential routing and signing key.
 - **A dotfiles repo is code.** Its install scripts run as the VM user, with
-  passwordless sudo and the project's tokens in reach — the same trust you give
+  passwordless sudo and the project's tokens on disk — the same trust you give
   an agent. Point this only at a repo you control.
 - **Agents keep running under bash.** They are launched with `SHELL=/bin/bash`,
   so dotfiles that switch the login shell (to zsh, say) change your interactive
   shell and IDE terminals, not the shell the agent runs its commands in.
 - A failed apply doesn't block the VM: it is reported, and `sandbox <project>
-  dotfiles` retries it.
+  dotfiles` retries it. chezmoi refuses to overwrite a managed file that was
+  edited in the VM; settle that inside it (`sandbox <project> shell`, then
+  `chezmoi update`).
 
 ## Toolchains (baked in by provisioning)
 

@@ -227,7 +227,7 @@ project_dotfiles() {   # echo the dotfiles repo URL this project wants, or nothi
     load_project "$PROJECT"
     local url="${_DOTFILES:-${AI_SANDBOX_DOTFILES:-}}"
     case "$url" in ""|none) return 0 ;; esac
-    valid_repo_url "$url" || die "use_dotfiles: '$url' is not a plain https:// repository URL"
+    valid_repo_url "$url" || die "dotfiles repo '$url' (use_dotfiles or \$AI_SANDBOX_DOTFILES) is not a plain https:// repository URL"
     printf '%s' "$url"
 }
 primary_record() { printf '%s' "$_IDENTITIES" | sed -n '1p'; }
@@ -489,13 +489,18 @@ ensure_daemons() {
 }
 
 # -------------------------------------------------------------------- dotfiles
-# Run as a plain `bash -s`, not a login shell: the dotfiles repo's scripts then
-# start without the pinned GH_TOKEN in their environment.
 apply_dotfiles() {   # $1 = ensure | update; assumes the VM is up
     local url; url="$(project_dotfiles)" || exit 1
     [ -n "$url" ] || return 0
     echo ">> dotfiles: $url"
     vm env DOTFILES_URL="$url" MODE="$1" bash -s < "$ROOT/lima/setup-dotfiles.sh"
+}
+
+# Apply dotfiles to a VM that has none yet; a failure is reported, never fatal.
+_SKIP_DOTFILES=0
+ensure_dotfiles() {
+    [ "$_SKIP_DOTFILES" = 0 ] || return 0
+    ( apply_dotfiles ensure ) || echo "   !! dotfiles were not applied — retry with: sandbox $PROJECT dotfiles"
 }
 
 # --------------------------------------------------------------- VM lifecycle
@@ -565,20 +570,19 @@ ensure_up() {
     if ! exists; then
         echo ">> creating VM '$INST' (first run provisions toolchains — a few minutes)..."
         limactl start --name "$INST" --tty=false "$TEMPLATE"
+        ensure_dotfiles        # first, so identities win over a dotfiles ~/.gitconfig
         configure_identities   # auto-apply project auth on first create
         _VM_COLD=1
     elif ! running; then
         ensure_vznat
         limactl start "$INST"
+        ensure_dotfiles
         _VM_COLD=1
     fi
     # Background daemons are *enabled* systemd units, so once installed they
     # come up with the VM on their own — no need to poke them on every command.
     # Installing them here is what makes them appear on a VM that predates them.
-    if [ "$_VM_COLD" = 1 ]; then
-        ( apply_dotfiles ensure ) || echo "   !! dotfiles were not applied — retry with: sandbox $PROJECT dotfiles"
-        ensure_daemons
-    fi
+    if [ "$_VM_COLD" = 1 ]; then ensure_daemons; fi
 }
 
 configure_identities() { # assumes VM is up
@@ -1605,7 +1609,8 @@ case "$CMD" in
         esac ;;
     dotfiles) durl="$(project_dotfiles)" || exit 1
               [ -n "$durl" ] || die "no dotfiles repo configured — add 'use_dotfiles <https-url>' to the config (sandbox $PROJECT config --edit) or export AI_SANDBOX_DOTFILES"
-              ensure_up; apply_dotfiles update ;;
+              _SKIP_DOTFILES=1; ensure_up
+              apply_dotfiles update || die "dotfiles were not applied — if chezmoi reports a file changed in the VM, resolve it there: sandbox $PROJECT shell, then 'chezmoi update'" ;;
     shell)    ensure_up; vm_login ;;
     code)     ensure_up
               command -v code >/dev/null 2>&1 || die "VS Code 'code' CLI not on PATH (install it / enable 'code' command)"
@@ -1717,7 +1722,7 @@ case "$CMD" in
         echo "status: present"
         load_project "$PROJECT"
         echo "agent:  ${_AGENT:-$DEFAULT_AGENT}$([ -n "$_AGENT" ] || echo '  (default)')"
-        echo "dotfiles: $(d="$(project_dotfiles)"; echo "${d:-none}")"
+        echo "dotfiles: $(d="$(project_dotfiles 2>/dev/null)" && echo "${d:-none}" || echo "INVALID — not a plain https:// repository URL")"
         if [ -z "$(printf '%s' "$_IDENTITIES" | tr -d ' \t\n')" ]; then
             echo "identities: none declared"
         else
