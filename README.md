@@ -39,7 +39,6 @@ sandbox <project> agent run <name> [args...]  # run an agent explicitly
 sandbox <project> daemon       # background daemons (Claude Remote Control): state of each
 sandbox <project> daemon logs [-f]        # journal of a background daemon
 sandbox <project> daemon restart|off      # restart, or stop and disable one
-sandbox <project> dotfiles     # apply (or pull and re-apply) your dotfiles repo in the VM
 sandbox <project> shell        # interactive shell in the VM
 sandbox <project> code [path]  # open VS Code (Remote-SSH) in the VM
 sandbox <project> up           # create/start the VM (auto-applies identities)
@@ -148,6 +147,10 @@ run those from `sandbox <project> shell` in `~/workspace`.
 > Built-in commands are matched before agent names, so an agent can never shadow
 > `shell`, `status`, etc. If one is named after a command, reach it with
 > `sandbox <project> agent run <name>`; `sandbox agents` flags the clash.
+
+Agents are launched with `SHELL=/bin/bash`. They run their commands in `$SHELL`,
+so changing the VM user's login shell (to zsh, say) changes your own sessions
+and IDE terminals, not how an agent's commands are parsed.
 
 ### Permissions
 
@@ -450,52 +453,6 @@ the one thing that turns a compromised agent — which runs with
 `--dangerously-skip-permissions` — into a compromised host, and no amount of
 path vetting makes that a boundary worth maintaining. Pulling files over SSH when
 you need them keeps the VM one-directional and the launcher small.
-
-## Your dotfiles in the VM
-
-Point a project at a [chezmoi](https://www.chezmoi.io) dotfiles repo and the VM
-gets your prompt, aliases and editor config:
-
-```sh
-# projects/acme.conf
-use_dotfiles https://github.com/my-user/dotfiles
-```
-
-or once for every project, in your own shell profile on the host:
-
-```sh
-export AI_SANDBOX_DOTFILES=https://github.com/my-user/dotfiles
-```
-
-A project's `use_dotfiles` wins over the variable, and `use_dotfiles none` opts
-one project out. The repo is applied (`chezmoi init --apply`) the first time a
-VM starts without dotfiles — so existing VMs get it on their next start — and
-left alone after that; a failed first apply is retried on the next start. To
-pull and re-apply later:
-
-```sh
-sandbox acme dotfiles
-```
-
-- **The URL must be a plain `https://` one**, without credentials. The clone is
-  anonymous: the project's token is not offered to the dotfiles host, so the
-  repo has to be public.
-- **chezmoi is pinned and verified** like the toolchains: an exact version,
-  checked against a SHA-256 recorded in `lima/setup-dotfiles.sh`. It is only
-  installed when the VM has none, so a newer one you install there is kept.
-- **Keep `~/.gitconfig` out of the dotfiles**, or expect to re-run `sandbox
-  <project> auth` and `keys` after each apply: that file holds the VM's git
-  identity, credential routing and signing key.
-- **A dotfiles repo is code.** Its install scripts run as the VM user, with
-  passwordless sudo and the project's tokens on disk — the same trust you give
-  an agent. Point this only at a repo you control.
-- **Agents keep running under bash.** They are launched with `SHELL=/bin/bash`,
-  so dotfiles that switch the login shell (to zsh, say) change your interactive
-  shell and IDE terminals, not the shell the agent runs its commands in.
-- A failed apply doesn't block the VM: it is reported, and `sandbox <project>
-  dotfiles` retries it. chezmoi refuses to overwrite a managed file that was
-  edited in the VM; settle that inside it (`sandbox <project> shell`, then
-  `chezmoi update`).
 
 ## Toolchains (baked in by provisioning)
 

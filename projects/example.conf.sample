@@ -26,11 +26,6 @@ use_agent claude
 # Omit for "the agent above, if it declares one"; `use_daemon none` disables.
 # use_daemon claude
 
-# Dotfiles repo (chezmoi) applied to the VM user's home on the VM's first start,
-# and again on `sandbox <project> dotfiles`. Omit to use $AI_SANDBOX_DOTFILES
-# from your environment, if set; `use_dotfiles none` disables.
-# use_dotfiles https://github.com/my-user/dotfiles
-
 # Optional: a second account whose token is used only for repos under one org.
 # Routing is by longest "<host>/<org>" match; everything else uses the primary.
 # add_identity \
@@ -49,5 +44,3 @@ use_agent claude
 # use_agent <name>     agent for a bare `sandbox <project>` (default: claude)
 # use_daemon <name>    agent whose background daemon the VM keeps running
 #                      (repeatable; default: the use_agent one; 'none' = off)
-# use_dotfiles <url>   https:// chezmoi dotfiles repo to apply in the VM
-#                      (default: $AI_SANDBOX_DOTFILES; 'none' = off)

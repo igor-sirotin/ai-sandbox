@@ -15,7 +15,6 @@
 #                                                 name collides with a command)
 #   sandbox <project> daemon         background daemons (e.g. `claude remote-control`):
 #                                    ls | status | logs [-f] | start | stop | restart | install | off
-#   sandbox <project> dotfiles       apply (or pull and re-apply) the configured dotfiles repo
 #   sandbox <project> shell          interactive shell in the VM
 #   sandbox <project> code [path]    open VS Code (Remote-SSH) in the VM
 #   sandbox <project> up             create/start the VM (auto-applies identities)
@@ -67,7 +66,7 @@ DEFAULT_AGENT="claude"
 
 # Commands are matched before the agent registry, so these names can never
 # resolve to an agent; `sandbox agents` warns if one is shadowed.
-BUILTIN_CMDS="up start auth keys set-email email rename mv migrate session sessions dotfiles shell code exec stop destroy delete status agent daemon daemons config conf audit secret token"
+BUILTIN_CMDS="up start auth keys set-email email rename mv migrate session sessions shell code exec stop destroy delete status agent daemon daemons config conf audit secret token"
 
 die() { echo "sandbox: $*" >&2; exit 1; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
@@ -88,8 +87,6 @@ valid_host()   { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; }
 # <host>/<org>, optionally deeper (<host>/<org>/<repo>) — cred-helper.sh
 # routes on the longest matching prefix, so deeper scopes are legal.
 valid_scope()  { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(/[A-Za-z0-9._-]+)+$ ]]; }
-# An https:// repo URL with no credentials, query or shell metacharacters.
-valid_repo_url() { [[ "$1" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]+)?(/[A-Za-z0-9._~-]+)+$ ]] && [[ "$1" != *".."* ]]; }
 # Free text (commit name): anything but control characters — it is single-quoted
 # when written to the config.
 valid_text()   { [ -n "$1" ] && [[ "$1" != *[[:cntrl:]]* ]]; }
@@ -168,12 +165,6 @@ use_agent() { _AGENT="$1"; }
 _DAEMONS=""
 use_daemon() { _DAEMONS="$_DAEMONS $1"; }
 
-# ...and `use_dotfiles <https-url>` to apply a chezmoi dotfiles repo to the VM
-# user's home. Absent => $AI_SANDBOX_DOTFILES from the host environment, if set;
-# `use_dotfiles none` turns it off for one project.
-_DOTFILES=""
-use_dotfiles() { _DOTFILES="$1"; }
-
 # Resolve a path to the file it finally points at. The checks below must apply
 # to what actually gets sourced, not to a symlink standing in front of it:
 # `find` does not follow links (-P is the default) and a macOS symlink is 0755,
@@ -216,19 +207,12 @@ conf_path() {
     printf '%s' "$real"
 }
 load_project() {
-    _IDENTITIES=""; _AGENT=""; _DAEMONS=""; _DOTFILES=""
+    _IDENTITIES=""; _AGENT=""; _DAEMONS=""
     local f="$PROJECTS/$1.conf" real
     [ -f "$f" ] || return 0
     real="$(conf_path "$f")" || exit 1
     # shellcheck source=/dev/null
     source "$real"
-}
-project_dotfiles() {   # echo the dotfiles repo URL this project wants, or nothing
-    load_project "$PROJECT"
-    local url="${_DOTFILES:-${AI_SANDBOX_DOTFILES:-}}"
-    case "$url" in ""|none) return 0 ;; esac
-    valid_repo_url "$url" || die "dotfiles repo '$url' (use_dotfiles or \$AI_SANDBOX_DOTFILES) is not a plain https:// repository URL"
-    printf '%s' "$url"
 }
 primary_record() { printf '%s' "$_IDENTITIES" | sed -n '1p'; }
 project_agent() { load_project "$1"; printf '%s' "${_AGENT:-$DEFAULT_AGENT}"; }
@@ -488,21 +472,6 @@ ensure_daemons() {
     return 0
 }
 
-# -------------------------------------------------------------------- dotfiles
-apply_dotfiles() {   # $1 = ensure | update; assumes the VM is up
-    local url; url="$(project_dotfiles)" || exit 1
-    [ -n "$url" ] || return 0
-    echo ">> dotfiles: $url"
-    vm env DOTFILES_URL="$url" MODE="$1" bash -s < "$ROOT/lima/setup-dotfiles.sh"
-}
-
-# Apply dotfiles to a VM that has none yet; a failure is reported, never fatal.
-_SKIP_DOTFILES=0
-ensure_dotfiles() {
-    [ "$_SKIP_DOTFILES" = 0 ] || return 0
-    ( apply_dotfiles ensure ) || echo "   !! dotfiles were not applied — retry with: sandbox $PROJECT dotfiles"
-}
-
 # --------------------------------------------------------------- VM lifecycle
 exists()  { limactl list -q 2>/dev/null | grep -qx "$INST"; }
 
@@ -570,13 +539,11 @@ ensure_up() {
     if ! exists; then
         echo ">> creating VM '$INST' (first run provisions toolchains — a few minutes)..."
         limactl start --name "$INST" --tty=false "$TEMPLATE"
-        ensure_dotfiles        # first, so identities win over a dotfiles ~/.gitconfig
         configure_identities   # auto-apply project auth on first create
         _VM_COLD=1
     elif ! running; then
         ensure_vznat
         limactl start "$INST"
-        ensure_dotfiles
         _VM_COLD=1
     fi
     # Background daemons are *enabled* systemd units, so once installed they
@@ -1607,10 +1574,6 @@ case "$CMD" in
             register) session_register "$@" ;;
             *) die "usage: sandbox $PROJECT session [ls] | copy <session-id|--all> <other-project> | export <session-id|--all> [file|-] | import <file|-> [--no-register] | register <session-id...|--all> [--running]" ;;
         esac ;;
-    dotfiles) durl="$(project_dotfiles)" || exit 1
-              [ -n "$durl" ] || die "no dotfiles repo configured — add 'use_dotfiles <https-url>' to the config (sandbox $PROJECT config --edit) or export AI_SANDBOX_DOTFILES"
-              _SKIP_DOTFILES=1; ensure_up
-              apply_dotfiles update || die "dotfiles were not applied — if chezmoi reports a file changed in the VM, resolve it there: sandbox $PROJECT shell, then 'chezmoi update'" ;;
     shell)    ensure_up; vm_login ;;
     code)     ensure_up
               command -v code >/dev/null 2>&1 || die "VS Code 'code' CLI not on PATH (install it / enable 'code' command)"
@@ -1722,7 +1685,6 @@ case "$CMD" in
         echo "status: present"
         load_project "$PROJECT"
         echo "agent:  ${_AGENT:-$DEFAULT_AGENT}$([ -n "$_AGENT" ] || echo '  (default)')"
-        echo "dotfiles: $(d="$(project_dotfiles 2>/dev/null)" && echo "${d:-none}" || echo "INVALID — not a plain https:// repository URL")"
         if [ -z "$(printf '%s' "$_IDENTITIES" | tr -d ' \t\n')" ]; then
             echo "identities: none declared"
         else
