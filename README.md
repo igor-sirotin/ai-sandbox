@@ -148,6 +148,10 @@ run those from `sandbox <project> shell` in `~/workspace`.
 > `shell`, `status`, etc. If one is named after a command, reach it with
 > `sandbox <project> agent run <name>`; `sandbox agents` flags the clash.
 
+Agents are launched with `SHELL=/bin/bash`. They run their commands in `$SHELL`,
+so changing the VM user's login shell (to zsh, say) changes your own sessions
+and IDE terminals, not how an agent's commands are parsed.
+
 ### Permissions
 
 Both agents are launched with approval prompts off — that's the point of the VM.
